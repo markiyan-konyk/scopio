@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>scopio_gateway</name>
+  <version>0.1.0</version>
+  <description>
+    HTTP/WebSocket API gateway for the SCOPIO microscope. Runs on the Pi next
+    to the driver nodes and translates authenticated JSON requests (from the
+    UI, galvo_draw, agents, or any program with an API key) into ROS 2 service
+    calls, topic subscriptions and action goals. External clients need zero
+    ROS, zero Docker and zero DDS configuration -- just HTTP.
+  </description>
+  <maintainer email="mark.konyk@gmail.com">Mark Konyk</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>rosidl_runtime_py</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>scopio_interfaces</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

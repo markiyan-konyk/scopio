@@ -1,0 +1,15 @@
+# Visit a sequence of absolute stage targets in order. The external computer
+# sends the WHOLE path so execution does not depend on per-step network latency
+# (the "send the whole path, run it, report back" pattern).
+scopio_interfaces/StagePoint[] points
+float32 settle_s          # pause at each point (e.g. to let beads settle / image)
+---
+# Result
+bool success
+int32 points_reached
+---
+# Feedback
+int32 current_index
+int32 x
+int32 y
+int32 z

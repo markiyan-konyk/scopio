@@ -1,0 +1,11 @@
+# Move the stage to an absolute target in Sangaboard steps (single move; for a
+# multi-point route use the stage/move_path action instead).
+int32 x
+int32 y
+int32 z
+---
+bool success
+string message
+int32 x          # resulting absolute position, steps
+int32 y
+int32 z

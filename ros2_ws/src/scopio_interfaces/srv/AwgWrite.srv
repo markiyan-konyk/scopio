@@ -1,0 +1,9 @@
+# Relay a raw VISA/SCPI command string to the galvo/laser AWG. The CALLER must
+# know the instrument's command language (this keeps the ROS node instrument-
+# agnostic and frozen). Use for DC pointing, sine/square/arbitrary waveforms,
+# output ON/OFF -- anything the instrument supports.
+#   e.g. ":SOURce1:VOLTage:OFFSet 1.2500"   ":OUTPut1 OFF"
+string command
+---
+bool success
+string error      # empty on success

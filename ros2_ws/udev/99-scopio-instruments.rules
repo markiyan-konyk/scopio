@@ -1,0 +1,34 @@
+# SCOPIO lab instruments -- let non-root users (and the containers) talk to them.
+#
+#   sudo cp ros2_ws/udev/99-scopio-instruments.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#   # then UNPLUG AND REPLUG the instrument (a running libusb session keeps the
+#   # old permissions; trigger alone does not re-open it)
+#
+# Why this is needed: libusb has to OPEN the device node (/dev/bus/usb/BBB/DDD)
+# just to read the descriptors pyvisa uses to build a resource name. Those nodes
+# are root-only by default, so a non-root `list_resources()` silently omits the
+# instrument -- no error, it simply is not there. Adding a rule is the fix;
+# running everything as root is not.
+#
+# MODE 0666 is deliberate: the Pi is a single-purpose lab machine and the
+# containers run as their own user. Tighten to GROUP="plugdev", MODE="0660" and
+# add your user to plugdev if you prefer.
+
+# Wavelength Electronics TC10-LAB temperature controller (USBTMC)
+SUBSYSTEM=="usb", ATTR{idVendor}=="1a45", ATTR{idProduct}=="3101", MODE="0666", TAG+="uaccess"
+
+# Rigol DG1000Z series arbitrary-waveform generator (USBTMC) -- the galvo AWG
+SUBSYSTEM=="usb", ATTR{idVendor}=="1ab1", ATTR{idProduct}=="0642", MODE="0666", TAG+="uaccess"
+
+# The kernel usbtmc driver's char devices (/dev/usbtmc0, ...).
+#
+# pyvisa-py does not use these: it DETACHES the kernel driver and talks through
+# libusb. On some kernels that leaves the instrument enumerating fine and
+# answering nothing -- every query times out. Sanity-check it directly:
+#     echo '*IDN?' > /dev/usbtmc0 && head -c 200 /dev/usbtmc0
+# If that answers and pyvisa times out, skip the fight: put
+#     TCLAB_RESOURCE=/dev/usbtmc0
+# in ros2_ws/.env. temperature_node reads the char device instead (see
+# TC10LAB.UsbtmcDevice). Requires this 0666 rule.
+KERNEL=="usbtmc[0-9]*", MODE="0666"

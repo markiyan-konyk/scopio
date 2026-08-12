@@ -1,0 +1,15 @@
+# Set any subset of the manual camera controls. Set a field to NaN to leave it
+# unchanged. analogue_gain is interpreted as a brightness ("exposure budget")
+# change, so it survives the next frame-rate change (see camera_node).
+float64 red_gain
+float64 green_gain
+float64 blue_gain
+float64 colour_gain
+float64 analogue_gain
+float64 contrast
+float64 saturation
+float64 brightness
+float64 sharpness
+---
+bool success
+string message

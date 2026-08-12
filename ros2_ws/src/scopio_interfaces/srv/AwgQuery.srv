@@ -1,0 +1,7 @@
+# Relay a raw VISA/SCPI *query* to the galvo/laser AWG and return its reply.
+#   e.g. "*IDN?"   ":SOURce1:VOLTage:OFFSet?"
+string command
+---
+bool success
+string response
+string error      # empty on success

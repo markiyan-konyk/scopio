@@ -1,0 +1,8 @@
+# Run a one-shot hardware auto-white-balance: the camera briefly enables AWB,
+# lets it converge, reads the colour gains it chose, freezes them, and returns
+# them. (Empty request.)
+---
+bool success
+float64 red_gain
+float64 blue_gain
+string message

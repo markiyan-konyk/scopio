@@ -1,0 +1,10 @@
+# Update the persisted spatial calibration. Set a field to NaN to leave it
+# unchanged. The new values are persisted to disk and re-published on the
+# latched `calibration` topic.
+float64 um_per_px
+float64 steps_per_um_x
+float64 steps_per_um_y
+float64 steps_per_um_z
+---
+bool success
+string message

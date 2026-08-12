@@ -1,0 +1,64 @@
+# SCOPIO node parameters. Loaded by microscope.launch.py.
+# Topic/namespace: everything lives under /scopio.
+#
+# The backend does NO image analysis: it senses, streams and effectuates.
+# Bead detection/tracking is a CLIENT concern, done off the Pi on the recorded
+# or streamed footage (see viscosity/ and viscosity_agent/).
+
+/scopio/camera_node:
+  ros__parameters:
+    width: 640
+    height: 480
+    framerate: 30.0          # capture fps (drives exposure/gain budget)
+    publish_fps: 15.0        # rate of the compressed image topic
+    jpeg_quality: 70
+    # NOTE: the camera node no longer records. Recording is a client concern
+    # (the UI saves the subscribed stream to its own local folder).
+
+/scopio/stage_node:
+  ros__parameters:
+    # Serial device of the Sangaboard. Empty => the library auto-detects by USB
+    # vendor/product id, which misses a board behind an unrecognised bridge.
+    # SANGABOARD_PORT in ros2_ws/.env wins over this.
+    port: ""
+    reconnect_period: 10.0
+    publish_rate: 5.0        # Hz, StagePosition
+    step_x: 40               # default jog/grid step (steps)
+    step_y: 40
+    step_z: 40
+
+/scopio/galvo_node:
+  ros__parameters:
+    # VISA resource of the AWG. Empty => auto-discover the first RIGOL-vendor USB
+    # device (it never opens another vendor's instrument). Set GALVO_RESOURCE in
+    # ros2_ws/.env to name it explicitly; that wins over this.
+    resource: ""
+    init_on_connect: true    # on connect, DC mode + outputs ON, so update(ch,val) moves the galvo
+    publish_rate: 5.0        # Hz, AwgStatus (cached state, no polling)
+    reconnect_period: 15.0
+    # 15 s, not 5: a large arbitrary-waveform upload takes the DG1022Z a few
+    # seconds to ingest over USB-TMC.
+    timeout_ms: 15000
+
+/scopio/temperature_node:
+  ros__parameters:
+    # Address of the TC10 LAB. Empty => auto-discover the first WAVELENGTH-vendor
+    # USB device. TCLAB_RESOURCE in ros2_ws/.env wins over this, and must be set
+    # for an Ethernet unit (pyvisa-py cannot scan the LAN) or to use the kernel
+    # usbtmc device (TCLAB_RESOURCE=/dev/usbtmc0).
+    resource: ""
+    units: "C"               # forced on connect; "" reads them instead
+    # 1 Hz costs FIVE USB-TMC round trips per second (see TC10LAB.status()).
+    # Turn it down if the instrument reports timeouts under load.
+    publish_rate: 1.0        # Hz, TemperatureStatus (this node polls)
+    # 5 s, not 15: opening this instrument is quick, and the session is only
+    # dropped after three consecutive failures, so retrying often cannot thrash.
+    reconnect_period: 5.0
+    timeout_ms: 5000
+
+/scopio/calibration_node:
+  ros__parameters:
+    # Persisted spatial calibration. Relative to the process working directory,
+    # which compose sets to /workspace -- the bind-mounted repo root on the Pi,
+    # so it survives `docker compose down`. The node logs the absolute path.
+    calibration_file: "calibration.json"

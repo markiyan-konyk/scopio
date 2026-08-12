@@ -1,0 +1,19 @@
+# Autofocus: sweep Z around the current position, measure image sharpness at
+# each step, and move the stage to the sharpest Z. This coordinates the camera
+# (focus metric, computed on the node's own frames) with the stage (Z moves via
+# the stage/jog service), so it lives on the backend and ANY client can call it
+# -- not just the UI. Every Z is approached from below to take up backlash.
+int32 z_range        # half-range to sweep, in stage steps (e.g. 2000)
+int32 steps          # number of sample points across the sweep (>=3, e.g. 15)
+float32 settle_s     # pause after each Z move before measuring (e.g. 0.2)
+---
+# Result
+bool success
+int32 best_z         # absolute Z (steps) the stage ended at
+float32 best_score   # focus score at best_z
+string message
+---
+# Feedback
+int32 index          # sample index just measured
+int32 z              # absolute Z at this sample
+float32 score        # focus score at this sample

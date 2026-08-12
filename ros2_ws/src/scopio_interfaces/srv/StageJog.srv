@@ -1,0 +1,12 @@
+# Relative jog of the stage by a displacement in Sangaboard steps. This is the
+# simple, low-latency move the UI press-and-hold uses (step SIZE is a client
+# concern -- the client sends the actual delta it wants).
+int32 dx
+int32 dy
+int32 dz
+---
+bool success
+string message
+int32 x          # resulting absolute position, steps
+int32 y
+int32 z
