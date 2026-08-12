@@ -78,7 +78,15 @@ comes up and you bring hardware online piece by piece.
 | `stage_node` | `stage/position` | `stage/jog`, `stage/move_abs` | `stage/move_path`, `scan_region` |
 | `galvo_node` | `awg/status` | `awg/call`, `awg/write`, `awg/query` | — |
 | `temperature_node` | `temperature/status` | `temperature/call` | — |
+| `relay_node` | `relay/state` (latched) | `relay/set` (`std_srvs/SetBool`) | — |
 | `calibration_node` | `calibration` (latched) | `calibration/set` | — |
+
+`relay_node` drives the laser relay from one BCM GPIO pin on the Pi itself
+(`gpio_pin`, default 17 — see `config/params.yaml` before changing `active_high`).
+It is the one node whose "degrade gracefully" has a safety edge: when a GPIO call
+throws, the relay's true position is unknown, and **unknown is published as ON**
+until an `off()` actually succeeds. A green "laser off" next to a live laser is
+the failure that must not happen.
 
 The field-level contract is the `.msg`/`.srv`/`.action` files in
 `src/scopio_interfaces/` — they carry their own comments and are the only

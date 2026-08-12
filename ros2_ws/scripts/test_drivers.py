@@ -22,8 +22,8 @@ sys.modules.setdefault("pyvisa", types.ModuleType("pyvisa"))
 
 from scopio_microscope.drivers import dispatch                      # noqa: E402
 from scopio_microscope.drivers.TC10LAB import (CONDITION_BITS, FAULT_BITS,  # noqa: E402
-                                               TC10LAB)
-from scopio_microscope.drivers.dg1022z import DG1022Z, usb_vid      # noqa: E402
+                                               TC10LAB, usb_vid)
+from scopio_microscope.drivers.dg1022z import DG1022Z               # noqa: E402
 
 
 class FakeDevice:
@@ -149,6 +149,28 @@ def test_every_scpi_call_goes_through_the_lock():
         if "self.device." in line and not any(a in line for a in allowed):
             raise AssertionError(f"dg1022z.py:{lineno} bypasses command()/query(): "
                                  f"{line.strip()}")
+
+
+def test_the_nodes_and_their_drivers_still_agree():
+    """THE bug this closes: dg1022z.py was overwritten with a bench copy that
+    had no command()/query()/_drop(), so galvo_node raised AttributeError on
+    every connect and the AWG read as absent hardware forever. Every test still
+    passed, because they all exercised the DRIVER and nothing checked the NODE's
+    half of the contract. Import alone cannot catch it -- the calls are inside
+    methods that only run against real hardware."""
+    import re
+
+    nodes = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "..", "src", "scopio_microscope", "scopio_microscope")
+    for module, driver, handle in (("galvo_node", DG1022Z, "gen"),
+                                   ("temperature_node", TC10LAB, "tc")):
+        with open(os.path.join(nodes, module + ".py"), encoding="utf-8") as f:
+            source = f.read()
+        called = set(re.findall(rf"\b{handle}\.([A-Za-z_]\w*)\s*\(", source))
+        missing = sorted(m for m in called if not hasattr(driver, m))
+        assert not missing, (f"{module}.py calls {handle}.{missing} -- "
+                             f"{driver.__name__} has no such method")
+        assert called, f"found no {handle}.* calls in {module}.py; regex stale?"
 
 
 def test_closed_session_is_a_clear_error():
@@ -549,6 +571,138 @@ def test_exposure_longer_than_the_frame_lowers_the_frame_rate():
     finally:
         cs.picam2 = None
         cs.state.update(framerate=30.0, exposure=20000)
+
+
+# ------------------------------------------------------- relay node
+class FakePin:
+    """A gpiozero OutputDevice that can be made to throw, per direction.
+
+    The flags are CLASS attributes on purpose: _open() constructs a fresh
+    device, and a re-opened pin has to inherit the fault being simulated."""
+
+    fail_on = fail_off = False
+
+    def __init__(self, pin, active_high=True, initial_value=False):
+        self.pin, self.value, self.closed = pin, initial_value, False
+
+    def on(self):
+        if FakePin.fail_on:
+            raise OSError("GPIO busy")
+        self.value = True
+
+    def off(self):
+        if FakePin.fail_off:
+            raise OSError("GPIO busy")
+        self.value = False
+
+    def close(self):
+        self.closed = True
+
+
+class FakeNode:
+    """Just enough rclpy.node.Node for the relay's state machine."""
+
+    def __init__(self, name):
+        self._params = {}
+        self.sent = []                       # every Bool published, in order
+
+    def declare_parameter(self, name, default):
+        self._params[name] = default
+
+    def get_parameter(self, name):
+        return types.SimpleNamespace(value=self._params[name])
+
+    def create_publisher(self, _type, _topic, _qos):
+        return types.SimpleNamespace(publish=lambda m: self.sent.append(m.data))
+
+    def create_service(self, *a, **kw):
+        return None
+
+    def create_timer(self, *a, **kw):
+        return None
+
+    def get_logger(self):
+        noop = lambda *a, **kw: None         # noqa: E731
+        return types.SimpleNamespace(info=noop, warning=noop, error=noop)
+
+    def destroy_node(self):
+        return None
+
+
+def _relay_node():
+    """Import relay_node with gpiozero and rclpy stubbed out."""
+    if "scopio_microscope.relay_node" in sys.modules:
+        return sys.modules["scopio_microscope.relay_node"]
+    stubs = {"gpiozero": {"OutputDevice": FakePin},
+             "rclpy": {},
+             "rclpy.node": {"Node": FakeNode},
+             "rclpy.qos": {"QoSProfile": lambda **kw: types.SimpleNamespace(**kw),
+                           "DurabilityPolicy": types.SimpleNamespace(
+                               TRANSIENT_LOCAL="transient_local")},
+             "std_msgs.msg": {"Bool": lambda data=False: types.SimpleNamespace(data=data)},
+             "std_srvs.srv": {"SetBool": object}}
+    for name, attrs in stubs.items():
+        mod = types.ModuleType(name)
+        for k, v in attrs.items():
+            setattr(mod, k, v)
+        sys.modules[name] = mod
+        if "." in name:                      # `from rclpy.node import Node`
+            parent, _, child = name.rpartition(".")
+            sys.modules.setdefault(parent, types.ModuleType(parent))
+            setattr(sys.modules[parent], child, mod)
+    from scopio_microscope import relay_node
+    return relay_node
+
+
+def test_a_relay_that_will_not_switch_off_is_never_reported_off():
+    """THE laser rule. When a GPIO call throws, the relay's real position is
+    unknown -- and unknown published as False is a green 'Laser OFF' button next
+    to a live laser. Only an off() that actually SUCCEEDED may report OFF."""
+    relay_node = _relay_node()
+    req = types.SimpleNamespace(data=True)
+    resp = lambda: types.SimpleNamespace(success=None, message="")   # noqa: E731
+    try:
+        node = relay_node.RelayNode()
+        assert node.sent == [False], node.sent      # claimed the pin, OFF
+
+        # Healthy pin: on() takes, and the state reported is the state reached.
+        assert node._set_relay(req, resp()).success is True
+        assert node._state is True and node.sent[-1] is True
+
+        # on() throws but the recovery off() works -> OFF is TRUE, so report it.
+        FakePin.fail_on, FakePin.fail_off = True, False
+        assert node._set_relay(req, resp()).success is False
+        assert node._state is False and node.sent[-1] is False
+
+        # Both directions throw: the position is unknown, so it is reported ON,
+        # and the device is dropped so the retry timer re-opens it.
+        FakePin.fail_on = FakePin.fail_off = True
+        assert node._set_relay(req, resp()).success is False
+        assert node._state is True and node.sent[-1] is True
+        assert node._relay is None
+
+        # Re-opening drives the pin off, which is both the recovery AND the safe
+        # action -- and only now may False be published again.
+        FakePin.fail_on = FakePin.fail_off = False
+        node._retry_open()
+        assert node._relay is not None
+        assert node._state is False and node.sent[-1] is False
+
+        # Shutdown leaves it off even when the (post-context) publish throws.
+        node.sent = _RaisesOnAppend()
+        pin = node._relay
+        node.destroy_node()
+        assert pin.value is False and pin.closed is True
+    finally:
+        FakePin.fail_on = FakePin.fail_off = False
+
+
+class _RaisesOnAppend(list):
+    """Publishing after rclpy has shut down raises; the relay must still be
+    switched off and released when it does."""
+
+    def append(self, item):
+        raise RuntimeError("InvalidHandle: context already shut down")
 
 
 def main():

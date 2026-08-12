@@ -56,6 +56,20 @@
     reconnect_period: 5.0
     timeout_ms: 5000
 
+/scopio/relay_node:
+  ros__parameters:
+    # BCM pin driving the laser relay. Do NOT use 14, 15 or 23-25: the
+    # sangaboard has them. 17 is physical pin 11.
+    gpio_pin: 17
+    # false = active-LOW relay board. READ THIS BEFORE SETTING IT: a Pi pin is
+    # an input with a pulldown until this node claims it, i.e. LOW, i.e. an
+    # active-low board is CLOSED -- laser ON -- from power-on through kernel
+    # boot, docker start and node startup, and for as long as this node stays
+    # down. Pin the line high in /boot/firmware/config.txt first:
+    #   gpio=17=op,dh
+    active_high: true
+    reconnect_period: 10.0   # s between attempts to claim the pin
+
 /scopio/calibration_node:
   ros__parameters:
     # Persisted spatial calibration. Relative to the process working directory,

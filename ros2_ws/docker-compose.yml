@@ -51,6 +51,12 @@ services:
       - SANGABOARD_PORT=${SANGABOARD_PORT:-}
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
       - CAMERA_URL=http://127.0.0.1:8081   # camera_node bridge mode upstream
+      # relay_node's GPIO backend, named rather than guessed. gpiozero probes
+      # lgpio -> rpigpio -> pigpio -> native and takes the first that imports;
+      # `native` imports anywhere and then does not drive a modern Pi's pins, so
+      # an unset factory can pick a backend that fails silently. python3-lgpio
+      # is installed in the image (see Dockerfile) -- say so.
+      - GPIOZERO_PIN_FACTORY=${GPIOZERO_PIN_FACTORY:-lgpio}
     working_dir: /workspace
     command: ros2 launch scopio_microscope microscope.launch.py
     # HOTPLUG, and why /dev is bind-mounted even though privileged is set:

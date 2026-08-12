@@ -43,8 +43,15 @@ TELEMETRY_TOPICS = [
     "camera/state",
     "awg/status",
     "temperature/status",
+    "relay/state",
     "calibration",
 ]
+
+# Published TRANSIENT_LOCAL by their nodes, so a late joiner -- like this
+# gateway -- still gets the last value instead of waiting for the next one.
+# Subscribing to these with the default durability receives NOTHING from a
+# topic that only ever publishes on change (the relay).
+LATCHED_TOPICS = {"calibration", "relay/state"}
 
 
 def resolve(path):
@@ -243,19 +250,19 @@ class RosBridge:
         from scopio_interfaces.msg import (  # noqa: F401 (types resolved here)
             AwgStatus, Calibration, CameraState, StagePosition, TemperatureStatus,
         )
+        from std_msgs.msg import Bool
         type_map = {
             "stage/position": StagePosition,
             "camera/state": CameraState,
             "awg/status": AwgStatus,
             "temperature/status": TemperatureStatus,
+            "relay/state": Bool,
             "calibration": Calibration,
         }
         for rel in TELEMETRY_TOPICS:
             full = resolve(rel)
             qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1)
-            if rel == "calibration":
-                # The calibration topic is latched (TRANSIENT_LOCAL) so late
-                # joiners -- like this gateway -- get the persisted value.
+            if rel in LATCHED_TOPICS:
                 qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
 
             def _make_cb(topic_full):

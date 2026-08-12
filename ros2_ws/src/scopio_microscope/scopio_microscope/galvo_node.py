@@ -114,9 +114,9 @@ class GalvoNode(Node):
         with self._lock:
             if self.gen is not None:
                 return True
+            # DG1022Z() does NOT open on construction -- the node opens it.
+            gen = DG1022Z(resource, timeout_ms=timeout_ms)
             try:
-                # DG1022Z() does NOT open on construction -- the node opens it.
-                gen = DG1022Z(resource, timeout_ms=timeout_ms)
                 gen._open()
                 idn = gen.query("*IDN?")
                 # Put both channels in DC mode at their offsets with outputs ON,
@@ -131,6 +131,9 @@ class GalvoNode(Node):
                 self.gen, self.idn, self.last_error = gen, idn, ""
                 self._failures = 0
             except Exception as exc:
+                # A session that opened and then failed still HOLDS the USB
+                # device; leaving it claimed makes every later retry fail too.
+                gen._drop()
                 self.last_error = str(exc)
                 # ECHO THE RESOURCE. Without it "Parsing error" is unreadable:
                 # a name that fails to parse is a config bug, a name that is not
@@ -142,7 +145,8 @@ class GalvoNode(Node):
                     f"  error:  {type(exc).__name__}: {exc}\n"
                     f"  INV_RSRC_NAME/parsing => the STRING is wrong (check "
                     f"GALVO_RESOURCE in ros2_ws/.env); RSRC_NFOUND/no Rigol => "
-                    f"the instrument is not on the bus.")
+                    f"the instrument is not on the bus.",
+                    throttle_duration_sec=60.0)
                 return False
         self.get_logger().info(f"AWG connected on {gen.resource}: {idn}")
         return True

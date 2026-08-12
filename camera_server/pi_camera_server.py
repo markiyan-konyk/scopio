@@ -360,46 +360,55 @@ def open_camera_forever():
     global picam2, camera_error, camera_list
     delay = 2.0
     while True:
+        cam = None
         try:
-
             cam = Picamera2()
-            for i, mode in enumerate(cam.sensor_modes):
-              print(f"SENSOR MODE {i}: {mode}", flush=True)
-            
-            full_fov_mode = cam.sensor_modes[5]
-            
-            config = cam.create_video_configuration(
-                sensor={
-                    "output_size": full_fov_mode["size"],
-                    "bit_depth": full_fov_mode["bit_depth"],
-                },
-                main={
-                    "size": SIZE,
-                    "format": "RGB888",
-                },
-                controls={"FrameRate": 30},
-            )
-            
-            cam.configure(config)
-            
-            # Explicitly request the complete sensor area.
-            crop = full_fov_mode.get("crop_limits")
-            if crop:
-                cam.set_controls({"ScalerCrop": crop})
-            
+            # Full field of view = the mode covering the most sensor area, which
+            # is then scaled down to SIZE. Chosen by area, NOT by a fixed index:
+            # sensors expose different numbers of modes (IMX219/IMX477 have 3-4),
+            # so sensor_modes[k] is an IndexError on the next camera module -- and
+            # one swallowed by the retry below, where it looks like absent hardware.
+            #
+            # NOTE: this changes the microscope's FOV, so um_per_px from a run
+            # before it is WRONG. Re-run the calibration after changing SIZE or
+            # this selection; nothing downstream can detect a stale value.
+            mode = max(cam.sensor_modes, key=lambda m: m["size"][0] * m["size"][1])
+            # The mode's own ceiling, never above it. A full-resolution mode does
+            # not do 30 fps (IMX708 4608x2592 tops out near 14); libcamera clamps
+            # silently, and then state["framerate"] -- which apply_controls uses
+            # for its exposure-vs-frame-duration budget -- describes a rate the
+            # sensor never delivers.
+            fps = min(state["framerate"], float(mode.get("fps") or state["framerate"]))
+            cam.configure(cam.create_video_configuration(
+                sensor={"output_size": mode["size"], "bit_depth": mode["bit_depth"]},
+                main={"size": SIZE, "format": "RGB888"},
+                controls={"FrameRate": fps},
+            ))
             cam.start_recording(MJPEGEncoder(), FileOutput(output))
             picam2 = cam
+            state["framerate"] = fps
             camera_error, camera_list = None, []
             # Print what this sensor actually offers: it is the fastest answer to
             # "why did that control not take" and it says mono vs colour outright.
-            print(f"Camera open {SIZE[0]}x{SIZE[1]}; controls advertised: "
-                  f"{sorted(cam.camera_controls)}", flush=True)
+            print(f"Camera open {SIZE[0]}x{SIZE[1]} from sensor mode "
+                  f"{mode['size'][0]}x{mode['size'][1]} @ {fps:g} fps "
+                  f"(re-run the calibration if this FOV changed); "
+                  f"controls advertised: {sorted(cam.camera_controls)}", flush=True)
             if "AwbEnable" not in cam.camera_controls:
                 print("  NOTE: no AwbEnable/ColourGains -- monochrome sensor. "
                       "Colour gains and /white_balance do nothing on this camera.",
                       flush=True)
             return
         except Exception as exc:
+            # Close whatever opened. Everything after Picamera2() can throw, and a
+            # leaked instance still OWNS the sensor: the next attempt then fails
+            # with "already in use" for good, turning one transient fault
+            # permanent and blaming a stray process in the diagnosis below.
+            if cam is not None:
+                try:
+                    cam.close()
+                except Exception:
+                    pass
             seen = enumerate_cameras()
             camera_error = f"{type(exc).__name__}: {exc}"
             camera_list = seen
