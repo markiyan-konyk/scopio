@@ -2,9 +2,9 @@
 
 The Raspberry Pi side of a self-driving-lab microscope. It owns the hardware and exposes all of it through one authenticated HTTP/WebSocket API.
 
-Built by Mark Konyk at MatterLab. <!-- TODO: name the institution MatterLab belongs to. -->
+Built by Markiyan Konyk, Minho Kim and Jesus Valdes at The MatterLab (University of Toronto).
 
-SCOPIO is the hardware layer of a self-driving-lab microscope, built on the OpenFlexure microscope, for a cryogenics lab. Every sensor and actuator is a ROS 2 node on a Raspberry Pi, always available behind one authenticated API. Any program, whether a UI, a script or an AI agent, can run experiments without touching the hardware code. New capabilities are added as new nodes. <!-- TODO: the maintainer should confirm or edit this paragraph (it is the draft from the documentation brief). -->
+SCOPIO is the hardware layer of a self-driving-lab microscope, built on the OpenFlexure microscope, for a cryogenics lab. Every sensor and actuator is a ROS 2 node on a Raspberry Pi, always available behind one authenticated API. Any program, whether a UI, a script or an AI agent, can run experiments without touching the hardware code. New hardware capabilities get implemented as new nodes.
 
 ## Two repos, two machines
 
@@ -105,7 +105,3 @@ The containers run the code baked into the image, so any change to `src/` or `sc
 - The recent instrument changes (TC10 transport by kernel ownership, I/O pacing, galvo timing) are not yet validated on the hardware.
 - The galvo settle times in scopio-apps are untuned guesses.
 - The Python dependencies in the Dockerfile are not version-pinned yet. Pinning from a `pip freeze` on the Pi is planned.
-
-## License
-
-MIT, as declared in each package's `package.xml` and `setup.py`. <!-- TODO: the repo has no LICENSE file yet; add one, or correct this line. -->

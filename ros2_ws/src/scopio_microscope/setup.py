@@ -22,7 +22,6 @@ setup(
     maintainer_email="mark.konyk@gmail.com",
     description="SCOPIO microscope driver nodes (camera, stage, galvo, "
                 "temperature, calibration).",
-    license="MIT",
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [

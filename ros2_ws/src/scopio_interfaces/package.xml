@@ -10,7 +10,7 @@
     (stage paths, galvo waveforms, region scans).
   </description>
   <maintainer email="mark.konyk@gmail.com">Mark Konyk</maintainer>
-  <license>MIT</license>
+  <license>TODO</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 

@@ -16,7 +16,6 @@ setup(
     maintainer="Mark Konyk",
     maintainer_email="mark.konyk@gmail.com",
     description="HTTP/WebSocket API gateway wrapping the SCOPIO ROS 2 graph.",
-    license="MIT",
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
