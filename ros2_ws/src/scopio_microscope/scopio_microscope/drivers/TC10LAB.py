@@ -1,31 +1,10 @@
-"""Wavelength Electronics TC10 LAB temperature controller.
-
-Same shape as dg1022z.DG1022Z: does not open on construction, the node calls
-_open(). Every public method is reachable over the temperature/call service.
-
-command() and query() are the only two methods the rest of the class uses, and
-they hold _lock -- the node serves temperature/call on a reentrant callback
-group while a timer polls status(), so two threads are regularly inside here.
-
-TWO TRANSPORTS, chosen by what TCLAB_RESOURCE looks like:
-
-  VISA         a resource string ("USB0::0x1A45::...", "TCPIP::10.0.0.5::INSTR"),
-               or empty to discover the first Wavelength box on USB.
-  kernel tmc   a path ("/dev/usbtmc0"). Use this when the kernel's usbtmc driver
-               has claimed the instrument: pyvisa-py then has to detach that
-               driver to reach it over libusb, and on some kernels the result is
-               a device that enumerates fine and answers nothing -- every query
-               times out. Reading and writing the char device the kernel already
-               owns sidesteps the fight. The udev rule ships 0666 on it.
-
-Command reference: COMMAND SET, LAB Series Instruments (COMMAND-00400 rev H).
-Temperatures follow set_units() -- Celsius by default.
-"""
+"""Wavelength Electronics TC10 LAB temperature controller (command set COMMAND-00400 rev H; see README.md)."""
 
 import glob
 import os
 import re
 import threading
+import time
 
 import pyvisa
 
@@ -48,15 +27,13 @@ CONDITION_BITS = {
 FAULT_BITS = (0, 2, 3, 4, 5, 6, 7, 11)
 
 UNITS = {0: "C", 1: "K", 2: "F", 3: "raw"}
-# TEC:UNITS? answers a code on some firmware and a word ('CELSIUS') on others;
-# both reduce to a first letter. TEC:UNITS takes the code either way.
+# TEC:UNITS? answers a code or a word ('CELSIUS') depending on firmware; TEC:UNITS takes the code.
 UNIT_NAMES = {"C": "C", "K": "K", "F": "F", "R": "raw"}
 UNIT_CODES = {"C": 0, "K": 1, "F": 2, "R": 3}
 
 
 def usb_vid(resource):
-    """Vendor id from a VISA resource string; pyvisa-py writes it in decimal,
-    NI-VISA in hex. None for non-USB resources."""
+    """Vendor id from a VISA resource string (decimal or hex); None for non-USB resources."""
     parts = resource.split("::")
     if len(parts) < 2 or not parts[0].upper().startswith("USB"):
         return None
@@ -70,23 +47,63 @@ def is_tc10(idn):
     return "TC10" in (idn or "").upper() or "WAVELENGTH" in (idn or "").upper()
 
 
+# --------------------------------------------------------------------------
+# Asking the KERNEL what is plugged in (sysfs; standard library only)
+# --------------------------------------------------------------------------
+SYSFS_USBMISC = "/sys/class/usbmisc"     # where the usbtmcN char devices live
+SYSFS_USB = "/sys/bus/usb/devices"
+
+
+def usbtmc_vid(path):
+    """Vendor id behind a /dev/usbtmcN node from sysfs, without writing to it; None if sysfs cannot say."""
+    try:
+        iface = os.path.realpath(os.path.join(SYSFS_USBMISC,
+                                              os.path.basename(path), "device"))
+        with open(os.path.join(os.path.dirname(iface), "idVendor"),
+                  encoding="ascii") as f:
+            return int(f.read().strip(), 16)
+    except (OSError, ValueError):
+        return None
+
+
+def usb_present(vid):
+    """sysfs names ('1-1.3') of every USB device with this vendor id: is the box on the bus at all?"""
+    found = []
+    for id_file in glob.glob(os.path.join(SYSFS_USB, "*", "idVendor")):
+        try:
+            with open(id_file, encoding="ascii") as f:
+                if int(f.read().strip(), 16) == vid:
+                    found.append(os.path.basename(os.path.dirname(id_file)))
+        except (OSError, ValueError):
+            continue
+    return sorted(found)
+
+
 class UsbtmcDevice:
-    """The kernel's usbtmc character device, with the slice of the pyvisa
-    resource API this driver uses. The kernel driver applies its own read
-    timeout, so a silent instrument surfaces as OSError(ETIMEDOUT)."""
+    """The kernel's usbtmc char device, with the slice of the pyvisa resource API used here."""
 
-    # The usbtmc driver reads until it has READ_SIZE bytes OR the device flags
-    # end-of-message, so an over-large count makes every read wait on a device
-    # that has already finished talking. 256 is the value tc10_read.py settled
-    # on against this instrument.
+    # The driver reads until this many bytes or end-of-message; too large and every read waits.
     READ_SIZE = 256
-    # USBTMC_IOCTL_CLEAR = _IO('[', 2). The kernel driver's name for the same
-    # USB-TMC CLEAR request pyvisa exposes as .clear(): flush both buffers.
+    # USBTMC_IOCTL_CLEAR = _IO('[', 2): the USB-TMC CLEAR, flushing both buffers.
     IOCTL_CLEAR = 0x5B02
+    # USBTMC_IOCTL_SET_TIMEOUT = _IOW('[', 10, __u32), in milliseconds.
+    IOCTL_SET_TIMEOUT = 0x40045B0A
 
-    def __init__(self, path):
+    def __init__(self, path, timeout_ms=None):
         self.path = path
         self._fd = os.open(path, os.O_RDWR)
+        if timeout_ms:
+            self._set_timeout(int(timeout_ms))
+
+    def _set_timeout(self, ms):
+        """Apply the node's timeout_ms (otherwise the kernel's 5 s default applies)."""
+        try:
+            import fcntl
+            import struct
+            fcntl.ioctl(self._fd, self.IOCTL_SET_TIMEOUT,
+                        struct.pack("I", max(100, ms)))   # kernel minimum: 100
+        except (ImportError, OSError):
+            pass          # an old kernel without the ioctl keeps its default
 
     def clear(self):
         import fcntl      # Linux-only; imported here so this module still loads
@@ -99,11 +116,7 @@ class UsbtmcDevice:
         self.write(cmd)
         raw = os.read(self._fd, self.READ_SIZE)
         if len(raw) == self.READ_SIZE:
-            # ponytail: single read. A reply longer than READ_SIZE leaves the
-            # tail queued, and every later query then returns the PREVIOUS
-            # answer -- a silent, permanent desync. Fail loudly instead; if a
-            # long query (TEC:SENSORLIST?) is ever needed, loop until the reply
-            # ends in a newline rather than raising the constant.
+            # A longer reply would leave its tail queued and desync every later query: fail loudly.
             raise IOError(f"reply to {cmd!r} exceeded {self.READ_SIZE} bytes; "
                           "session would desync")
         return raw.decode(errors="replace")
@@ -113,122 +126,178 @@ class UsbtmcDevice:
 
 
 class TC10LAB:
+    # Pacing: at most 50 I/Os per second; the TC10 lags badly past ~60/s.
+    MIN_INTERVAL_S = 1.0 / 50
+
     def __init__(self, resource="", timeout_ms=5000):
         self.resource = resource
         self.timeout_ms = timeout_ms
         self._lock = threading.RLock()
+        self._last_io = 0.0     # monotonic end of the previous I/O
         self.rm = None
         self.device = None
         self.units = ""       # cached by set_units()/get_units(); see status()
-        self.probe_note = ""  # set when _open_usbtmc had to work around the config
+        self.identity = ""    # *IDN? reply, verified on connect
+        self.probe_note = ""  # set when _open had to work around the config
+        self._rejected = []   # usbtmc nodes tried and why they were refused
         self._desynced = False  # a query failed; drain before trusting the next
 
+    # ======================================================================
+    # Connecting
+    # ======================================================================
     def _open(self):
-        if self.resource.startswith("/dev/"):
-            self._open_usbtmc()
-            self._resync()
-            return
-        self._open_visa()
-        # BOTH transports resync. This used to run on the usbtmc path only, and
-        # the VISA path is if anything more exposed: a connect attempt that
-        # times out (VI_ERROR_TMO) has already sent a query whose reply nobody
-        # read, so the very next session starts one answer behind.
+        """Open a session, choosing the transport by kernel ownership: usbtmc if the kernel owns it, else VISA."""
+        res = self.resource.strip()
+        if res and not res.startswith("/dev/") and not res.upper().startswith("USB"):
+            self._open_visa(res)                  # TCPIP::... -- VISA or nothing
+        else:
+            owned, unknown = self._usbtmc_candidates(res)
+            if owned:
+                self._open_usbtmc(owned, required=True)
+            elif not (unknown and self._open_usbtmc(unknown, required=False)):
+                if res.startswith("/dev/"):
+                    self.probe_note = (
+                        f"{res!r}: no usbtmc node belongs to a TC10 (the kernel "
+                        "driver is not bound -- a VISA session detaches it until "
+                        "the box is replugged); reaching it over VISA instead")
+                self._open_visa(res if res.upper().startswith("USB") else "")
+        # CLEAR before *IDN?: a timed-out attempt may have left a reply queued.
         self._resync()
+        self._verify()
 
-    def _open_visa(self):
+    def _usbtmc_candidates(self, res):
+        """(usbtmc nodes sysfs says are Wavelength, nodes it cannot identify); others (the AWG) are left alone."""
+        named = sorted(glob.glob(res)) if res.startswith("/dev/") else []
+        nodes = named + [p for p in sorted(glob.glob(USBTMC_GLOB)) if p not in named]
+        if res.startswith("/dev/") and not named and nodes:
+            self.probe_note = (f"{res!r} matched nothing -- fix it in "
+                               f"ros2_ws/.env; probing {nodes} instead")
+        owned, unknown = [], []
+        for path in nodes:
+            vid = usbtmc_vid(path)
+            if vid == WAVELENGTH_VID:
+                owned.append(path)
+            elif vid is None:
+                unknown.append(path)
+        if owned and res.upper().startswith("USB"):
+            self.probe_note = (
+                f"{res!r} is a VISA address, but the kernel usbtmc driver owns "
+                f"the TC10 ({', '.join(owned)}); using that -- VISA would have to "
+                "detach the driver, which hangs on this Pi")
+        return owned, unknown
+
+    def _open_usbtmc(self, paths, required):
+        """Open the first of `paths` that answers as a TC10; required=True never falls back to VISA."""
+        for path in paths:
+            try:
+                dev = UsbtmcDevice(path, self.timeout_ms)
+            except OSError as exc:
+                self._rejected.append(f"{path}: {exc}")
+                continue
+            try:
+                idn = self._probe_idn(dev)
+                if is_tc10(idn):
+                    self.device, self.resource = dev, path
+                    return True
+                self._rejected.append(f"{path}: not a TC10 ({idn!r})")
+            except Exception as exc:
+                self._rejected.append(f"{path}: {type(exc).__name__}: {exc}")
+            try:
+                dev.close()
+            except OSError:
+                pass
+        if required:
+            raise RuntimeError(
+                "the kernel usbtmc driver owns the TC10 but it did not answer as "
+                "one: " + "; ".join(self._rejected) + ". Power-cycle the TC10; if "
+                "it persists, `echo '*IDN?' > /dev/usbtmcN && head -c 200 "
+                "/dev/usbtmcN` on the host tells the kernel side from this node.")
+        return False
+
+    @staticmethod
+    def _probe_idn(dev):
+        """*IDN? on an uncleared device: CLEAR first, so a stale reply is not read as the identity."""
+        idn = ""
+        for _ in range(2):
+            try:
+                dev.clear()
+            except Exception:
+                pass
+            dev.write("*CLS")
+            idn = dev.query("*IDN?").strip()
+            if is_tc10(idn) or "," in idn:        # an identity, ours or not
+                break
+        return idn
+
+    def _open_visa(self, res):
         self.rm = pyvisa.ResourceManager("@py")
-        if not self.resource:
-            # Match the vendor id in the resource string so we never open
-            # another instrument just to ask what it is.
-            usb = [r for r in self.rm.list_resources("USB?*INSTR")
-                   if usb_vid(r) == WAVELENGTH_VID]
+        if not res:
+            # Match the vendor id in the string: never open another instrument to ask what it is.
+            listed = list(self.rm.list_resources("USB?*INSTR"))
+            usb = [r for r in listed if usb_vid(r) == WAVELENGTH_VID]
             if not usb:
-                raise RuntimeError(
-                    "no TC10 LAB on USB. Set TCLAB_RESOURCE: an Ethernet unit "
-                    "must be named (pyvisa-py cannot scan the LAN), and "
-                    "/dev/usbtmc0 works when the kernel driver holds the box.")
-            self.resource = usb[0]
-        self.device = self.rm.open_resource(self.resource)
+                raise RuntimeError(self._not_found(listed))
+            res = usb[0]
+        self.device = self.rm.open_resource(res)
+        self.resource = res
         self.device.read_termination = "\n"
         self.device.write_termination = "\n"
         self.device.timeout = self.timeout_ms
 
-    def _open_usbtmc(self):
-        """Open a kernel usbtmc char device, VERIFYING it is this instrument.
+    def _not_found(self, listed):
+        """Why no transport found a TC10, starting from whether it is on the bus at all."""
+        bus = usb_present(WAVELENGTH_VID)
+        if not bus:
+            return ("no TC10 LAB on the USB bus: the kernel reports no 1a45 "
+                    "device. Check the cable, the rear power switch and any hub. "
+                    "An Ethernet unit must be named: "
+                    "TCLAB_RESOURCE=TCPIP::<ip>::INSTR.")
+        tried = f" usbtmc nodes tried: {'; '.join(self._rejected)}." if self._rejected else ""
+        return (f"a TC10 LAB IS on the USB bus ({', '.join(bus)}), but no "
+                "transport reached it. It has no /dev/usbtmc node (the kernel "
+                "driver is not bound -- replug to rebind it), and VISA listed "
+                f"{len(listed)} USB instrument(s), none of them it: libusb could "
+                "not read its descriptors -- device permissions (ros2_ws/udev) "
+                "or another process holding it." + tried)
 
-        A /dev/... resource selects the TRANSPORT, not the node. The exact path
-        was never load-bearing: /dev/usbtmc0 is not reliably the TC10 (the Rigol
-        AWG is USB-TMC too, and the kernel numbers them in enumeration order, so
-        a hard-coded node can point this node at the function generator -- two
-        nodes on one instrument, which reads as a flapping link). So every
-        /dev/usbtmc* is a candidate, each is asked *IDN?, and only a Wavelength
-        box is accepted. Whatever was configured is tried FIRST, to honour an
-        explicit choice; a pattern that matches nothing is a typo, not a reason
-        to ignore an instrument that is plainly present.
-        """
-        named = sorted(glob.glob(self.resource))
-        candidates = named + [p for p in sorted(glob.glob(USBTMC_GLOB))
-                              if p not in named]
-        if not candidates:
-            raise FileNotFoundError(
-                f"no usbtmc device matches {self.resource!r}, and no "
-                f"{USBTMC_GLOB} exists in THIS process's /dev. In a container, "
-                "compare with the host: if the host has the node and the "
-                "container does not, recreate the container (its /dev is "
-                "populated at creation) and check the /dev:/dev mount. If the "
-                "HOST has none either, the kernel usbtmc driver is not bound: "
-                "set TCLAB_RESOURCE to a VISA address instead.")
-        if not named:
-            self.probe_note = (f"{self.resource!r} matched nothing -- fix it in "
-                               f"ros2_ws/.env; probing {candidates} instead")
-        rejected = []
-        for path in candidates:
-            try:
-                dev = UsbtmcDevice(path)
-            except OSError as exc:
-                rejected.append(f"{path}: {exc}")
-                continue
-            try:
-                dev.write("*CLS")           # clear status + error queue
-                idn = dev.query("*IDN?").strip()
-                if is_tc10(idn):
-                    self.device = dev
-                    self.resource = path
-                    return
-                rejected.append(f"{path}: not a TC10 ({idn!r})")
-            except Exception as exc:
-                rejected.append(f"{path}: {type(exc).__name__}: {exc}")
-            dev.close()
-        raise RuntimeError("no Wavelength TC10 answered on " + ", ".join(rejected))
+    def _verify(self):
+        """The session must answer *IDN? as a TC10, never as another node's instrument."""
+        idn = self.query("*IDN?")
+        if not is_tc10(idn):
+            raise RuntimeError(f"{self.resource} answered *IDN? with {idn!r} -- "
+                               "that is not a Wavelength TC10 LAB")
+        self.identity = idn
 
     def _resync(self):
-        """Throw away any reply still queued in the instrument.
-
-        Neither transport frames replies to requests: a reply nobody read stays
-        queued, so the next query returns IT and everything after is one answer
-        behind -- numbers that parse cleanly and are wrong.
-
-        This uses the USB-TMC CLEAR control request, which flushes the
-        instrument's input AND output buffers in-protocol. It does NOT try to
-        read the backlog away with *STB?: every query WRITES one request and
-        READS one reply, so a drain made of queries removes exactly as many
-        replies as it adds and the backlog survives untouched. That is not
-        theoretical -- it is what made this node report its instrument's
-        identity as "0".
-
-        Called on connect and after any failed query. Best effort: if the link
-        is genuinely dead the caller's own query reports it, and raising from
-        here would only hide that.
-        """
+        """Flush queued replies with the USB-TMC CLEAR (never a query drain), then *CLS. Best effort."""
         self._desynced = False
         try:
             self.device.clear()      # USB-TMC CLEAR: flush both buffers
         except Exception:
-            pass
+            self._drain()            # transport without CLEAR: read it away
         try:
             self.command("*CLS")     # then the status + error queues
         except Exception:
             pass
+
+    def _drain(self):
+        """Fallback without CLEAR: read, never write, until nothing is queued."""
+        read = getattr(self.device, "read", None)
+        if read is None:
+            return
+        old = getattr(self.device, "timeout", None)
+        try:
+            self.device.timeout = 200
+            for _ in range(16):
+                read()
+        except Exception:
+            pass                     # the timeout IS "nothing left"
+        finally:
+            if old is not None:
+                try:
+                    self.device.timeout = old
+                except Exception:
+                    pass
 
     def _close(self):
         """Drop the session. Safe to call twice, and on an already-dead link."""
@@ -241,12 +310,22 @@ class TC10LAB:
                     pass
             self.device = self.rm = None
 
+    def _pace(self):
+        """Wait out MIN_INTERVAL_S since the previous I/O; call with _lock held."""
+        wait = self._last_io + self.MIN_INTERVAL_S - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+
     def command(self, cmd):
         """Write a raw SCPI command."""
         with self._lock:
             if self.device is None:
                 raise ConnectionError("TC10 LAB session is closed")
-            self.device.write(cmd)
+            self._pace()
+            try:
+                self.device.write(cmd)
+            finally:
+                self._last_io = time.monotonic()
 
     def query(self, cmd):
         """Write a raw SCPI query and return the reply, stripped."""
@@ -255,28 +334,18 @@ class TC10LAB:
                 raise ConnectionError("TC10 LAB session is closed")
             if self._desynced:
                 self._resync()
+            self._pace()
             try:
                 return self.device.query(cmd).strip()
             except Exception:
-                # THE reason to care: a query that times out has still been SENT,
-                # so its reply arrives later and sits in the instrument's output
-                # queue. Every query after it returns the PREVIOUS answer --
-                # numbers that parse cleanly, publish happily, and are wrong.
-                # Nothing raises, so the failure counter never trips and the
-                # node reports a healthy instrument reading its setpoint as its
-                # temperature. Drain before the next query instead.
+                # Its reply may still arrive: resync before the next query, or every answer is one behind.
                 self._desynced = True
                 raise
+            finally:
+                self._last_io = time.monotonic()
 
     def query_float(self, cmd):
-        """float() of a reply, tolerating a decoration the firmware may add.
-
-        This unit does not always answer in the form the command reference
-        implies -- TEC:UNITS? returns 'CELSIUS', not '0'. So a bare float() on a
-        reply is a landmine: one decorated number used to take the whole node
-        down at connect. Take the leading number if there is one, and only then
-        give up.
-        """
+        """Query and return a float, taking the leading number if the firmware decorates the reply."""
         reply = self.query(cmd)
         try:
             return float(reply)
@@ -334,28 +403,19 @@ class TC10LAB:
     def aux_temperature(self):  return self.query_float("TEC:AUX?")     # 2nd sensor (heatsink)
 
     def output(self, on):
-        """Enable/disable TEC current. NOTHING heats or cools until this is on.
-        Overridden by the rear-panel Remote Enable input (DB-9 pin 1)."""
+        """Enable/disable TEC current; nothing heats or cools until on (rear Remote Enable can override)."""
         return self.command(f"TEC:OUTput {1 if on else 0}")
 
     def output_enabled(self):   return self.query("TEC:OUTput?") == "1"
 
     def set_units(self, units):
-        """Active temperature units. Accepts a code (0/1/2/3) or a letter
-        (C/K/F/raw) and always sends the CODE, which is what the command
-        reference documents. Reads them back, so `units` stays correct without
-        status() spending a round trip on it."""
+        """Set the active units by code (0-3) or letter (C/K/F/raw); reads them back and returns them."""
         code = UNIT_CODES.get(str(units).strip().upper()[:1], units)
         self.command(f"TEC:UNITS {code}")
         return self.get_units()
 
     def get_units(self):
-        """Active units as 'C'/'K'/'F'/'raw'.
-
-        The reply is a code on some firmware and a word ('CELSIUS') on others,
-        so both are accepted. This is a LABEL for the status topic -- never let
-        it decide whether the instrument is usable.
-        """
+        """Active units as 'C'/'K'/'F'/'raw' (a label for the status topic)."""
         reply = self.query("TEC:UNITS?").strip().upper()
         self.units = (UNITS.get(int(reply), "?") if reply.isdigit()
                       else UNIT_NAMES.get(reply[:1], "?"))
@@ -383,11 +443,7 @@ class TC10LAB:
     # Sensor selection & bias
     # ======================================================================
     def set_sensor(self, name):
-        """Pick the feedback sensor by NAME. Factory names (manual p.89):
-        TCS605-10/-100 (5k), TCS610-10/-100 (10k, the default), TCS620-*,
-        TCS650-*, TCS651-* (100k), 'RTD 100 DIN', 'RTD 1k DIN', '*IR SENSOR',
-        LM335, AD590 -- or any profile you made with add_thermistor() etc.
-        The -10/-100 suffix is the bias current the calibration was taken at."""
+        """Pick the feedback sensor by name, e.g. 'TCS610-10' (default), 'RTD 100 DIN', LM335 (manual p.89)."""
         return self.command(f"TEC:SENSOR {name}")
 
     def get_sensor(self):       return self.query("TEC:SENSOR?")       # calibration coefficients
@@ -395,8 +451,7 @@ class TC10LAB:
     def delete_sensor(self, name): return self.command(f"TEC:SENSORDEL {name}")
 
     def set_bias(self, code):
-        """Sensor bias current: 0 auto (default), 1 10uA, 2 100uA, 3 1mA, 4 10mA.
-        Any non-zero value DISABLES auto-ranging."""
+        """Sensor bias: 0 auto (default), 1 10uA, 2 100uA, 3 1mA, 4 10mA; non-zero disables auto-ranging."""
         return self.command(f"TEC:BIAS {int(code)}")
 
     def get_bias(self):         return self.query("TEC:BIAS?")         # "AUTO,1" / "MAN,1"
@@ -404,24 +459,18 @@ class TC10LAB:
     def get_aux_bias(self):     return self.query("TEC:AUX:BIAS?")
 
     # ======================================================================
-    # Custom sensor calibration (CONST:*) -- name is max 15 chars, no commas.
-    # A sensor cannot be edited once made: delete_sensor() then re-create.
+    # Custom sensors (CONST:*): names max 15 chars, no commas; delete to edit
     # ======================================================================
     def add_thermistor(self, name, a, b, c):
-        """Steinhart-Hart: 1/T = A + B*ln(R) + C*ln(R)^3 (from the datasheet).
-        Append '.F1'/'.F2'/'.F3'/'.F4' to `name` to pin the bias current to
-        10uA/100uA/1mA/10mA instead of auto-ranging.
-        e.g. add_thermistor('Therm10k', 1.1279e-03, 2.3429e-04, 8.7298e-08)"""
+        """Add a Steinhart-Hart thermistor (1/T = A + B ln R + C ln^3 R); a '.F1'-'.F4' name suffix pins the bias."""
         return self.command(f"CONST:THERM {name},{a},{b},{c}")
 
     def add_thermistor_points(self, name, t1, r1, t2, r2, t3, r3):
-        """Same, from three (temperature C, resistance ohm) pairs -- the
-        instrument fits Steinhart-Hart for you."""
+        """Add a thermistor from three (temperature C, resistance ohm) pairs; the instrument fits it."""
         return self.command(f"CONST:THERM {name},{t1},{r1},{t2},{r2},{t3},{r3}")
 
     def add_rtd(self, name, standard="D", r0=100, wires=4):
-        """Callendar-Van Dusen RTD. standard: 'D' DIN 43760, 'A' American,
-        'I' ITS-90. r0 = resistance at 0 C. wires: 3 or 4."""
+        """Add a Callendar-Van Dusen RTD: standard 'D' DIN 43760, 'A' American or 'I' ITS-90; r0 at 0 C; 3 or 4 wires."""
         return self.command(f"CONST:RTD{int(wires)} {name},{standard},{r0}")
 
     def add_rtd_linear(self, name, t1, r1, t2, r2, wires=4):
@@ -443,8 +492,7 @@ class TC10LAB:
     # PID & IntelliTune
     # ======================================================================
     def set_pid(self, p, i=None, d=None):
-        """P 0.1..1000 (default 12), I 0..200 (0.1), D OFF or 1..100 (0).
-        Pass p only, p+i, or all three -- the instrument reads them in order."""
+        """Set PID: P 0.1-1000 (default 12), I 0-200 (0.1), D OFF or 1-100 (0); pass p, p+i, or all three."""
         parts = [str(p)] + ([str(i)] if i is not None else []) + \
                 ([str(d)] if d is not None else [])
         return self.command("TEC:PID " + ",".join(parts))
@@ -458,9 +506,7 @@ class TC10LAB:
     def get_autotune(self):     return self.query_int("TEC:AUTOTUNE?")
 
     def tune_start(self):
-        """Run IntelliTune in the configured mode. Preconditions (manual p.92):
-        output OFF, temperature units (not RAW), setpoint at least 5 C off
-        ambient. Current limits drop to 10% for the duration. Takes minutes."""
+        """Run IntelliTune (minutes): needs output OFF, real units, setpoint 5 C or more from ambient (manual p.92)."""
         return self.command("TEC:TUNESTART")
 
     def tune_abort(self):       return self.command("TEC:TUNEABORT")   # reverts to old PID
@@ -486,9 +532,7 @@ class TC10LAB:
         return (self.query_float("TEC:LIMit:TLO?"), self.query_float("TEC:LIMit:THI?"))
 
     def set_sensor_limits(self, low, high):
-        """In the sensor's PHYSICAL units (ohms for a thermistor/RTD, volts for
-        LM335/AD590). Note a thermistor's resistance falls as temperature rises,
-        so `low` resistance == high temperature."""
+        """Sensor limits in physical units (ohms or volts); for a thermistor, low resistance = high temperature."""
         self.command(f"TEC:LIMit:RLO {low}")
         return self.command(f"TEC:LIMit:RHI {high}")
 
@@ -496,8 +540,7 @@ class TC10LAB:
         return (self.query_float("TEC:LIMit:RLO?"), self.query_float("TEC:LIMit:RHI?"))
 
     def set_voltage_limit(self, volts):
-        """Internal supply compliance. TC10 LAB rev A-C: 9..18 V, rev D: 10..27 V.
-        IntelliTune sets this itself -- keep its value for best settling."""
+        """Supply compliance in volts (rev A-C 9-18 V, rev D 10-27 V); IntelliTune sets it itself."""
         return self.command(f"TEC:VLIM {volts}")
 
     def get_voltage_limit(self): return self.query_float("TEC:VLIM?")
@@ -524,18 +567,12 @@ class TC10LAB:
     def enable_event(self, mask):     return self.command(f"TEC:ENABle:EVEnt {int(mask)}")
 
     def faults(self):
-        """Decoded TEC:COND? -> ['sensor_open', 'temp_high_limit', ...]. Empty == healthy.
-        Open/short circuits are TRANSIENT: the output trips off and the bit clears,
-        so a fault seen on the front panel may already be gone here -- event()
-        latches those."""
+        """Decoded fault names from TEC:COND?, empty when healthy (transient faults clear; event() latches them)."""
         cond = self.query_int("TEC:COND?")
         return [CONDITION_BITS[b] for b in FAULT_BITS if cond & (1 << b)]
 
     def status(self):
-        """Everything the status topic needs, in FIVE round trips. This runs on
-        the node's poll timer, so every query added here is one more chance per
-        second for the instrument to be mid-reply when the next one arrives.
-        `units` is the cached value from set_units()/get_units()."""
+        """Everything the status topic needs, in five queries; polled every second, so keep it lean."""
         cond = self.query_int("TEC:COND?")
         return {
             "temperature": self.query_float("TEC:ACT?"),
@@ -576,18 +613,14 @@ class TC10LAB:
     # Instrument-side scans and scripts
     # ======================================================================
     def profile_scan(self, n, start, stop, step, wait_s):
-        """Configure the front-panel temperature scan stored in profile n.
-        wait_s = 0 means 'wait until in tolerance' instead of a fixed dwell.
-        Scans cannot run in RAW units."""
+        """Configure the front-panel scan stored in profile n; wait_s = 0 waits for tolerance (not in RAW units)."""
         self.command(f"PROFile:SCANSTART {int(n)},{start}")
         self.command(f"PROFile:SCANSTOP {int(n)},{stop}")
         self.command(f"PROFile:SCANSTEP {int(n)},{step}")
         return self.command(f"PROFile:SCANWAIT {int(n)},{wait_s}")
 
     def put_script(self, index, script):
-        """Store a script (index 1..4, max 200 chars). Commands are separated by
-        CARATS, not semicolons, and the command path is not repeated:
-            put_script(1, 'TEC:SET 25^LIMit:IPOS 3.2^OUT 1')"""
+        """Store a script (index 1-4, max 200 chars), commands separated by ^, e.g. 'TEC:SET 25^OUT 1'."""
         return self.command(f"SCRIPT:PUT {int(index)},{script}")
 
     def run_script(self, index):  return self.command(f"SCRIPT:GO {int(index)}")

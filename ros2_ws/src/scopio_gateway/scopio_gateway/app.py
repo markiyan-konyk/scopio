@@ -1,25 +1,7 @@
-"""FastAPI application: the SCOPIO microscope's public API surface.
-
-All routes live under /api/v1. Interactive docs at /docs (they double as a
-live, always-correct reference for the curated routes; the generic
-service/topic/action surface is documented in docs/API.md and discoverable at
-GET /api/v1/interfaces).
-
-Route map (auth = X-API-Key header or ?api_key= unless noted):
-
-  GET  /api/v1/health                 no auth -- liveness for scripts/monitors
-  GET  /api/v1/interfaces             discover services/topics/actions + schemas
-  GET  /api/v1/status                 one-call snapshot of the whole microscope
-  POST /api/v1/service/{path}         GENERIC: call any ROS service as JSON
-  WS   /api/v1/ws                     topic streams + actions (see ws.py)
-  GET  /api/v1/stream.mjpg            live camera video (MJPEG)
-  GET  /api/v1/camera/controls        current camera settings
-  POST /api/v1/camera/controls        set camera settings (partial JSON)
-  POST /api/v1/camera/white_balance   one-shot AWB
-  GET  /api/v1/camera/focus           cheap focus metric
-"""
+"""FastAPI routes of the SCOPIO API, all under /api/v1 (see README.md and docs/API.md)."""
 
 import asyncio
+from contextlib import asynccontextmanager
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 
@@ -29,7 +11,16 @@ from .introspection import interfaces_payload
 from .ros_bridge import UnknownInterface, bridge
 from .ws import websocket_endpoint
 
+
+@asynccontextmanager
+async def _lifespan(_app):
+    # The rclpy thread needs this loop; a lifespan, since on_event is deprecated and FastAPI is unpinned.
+    bridge.loop = asyncio.get_running_loop()
+    yield
+
+
 app = FastAPI(
+    lifespan=_lifespan,
     title="SCOPIO Microscope API",
     version="1.0",
     description=(
@@ -39,13 +30,6 @@ app = FastAPI(
         "and GET /api/v1/interfaces for live discovery."
     ),
 )
-
-
-@app.on_event("startup")
-async def _capture_loop():
-    # The rclpy executor thread needs a handle on this loop to hand results
-    # and telemetry back to request handlers / websocket queues.
-    bridge.loop = asyncio.get_running_loop()
 
 
 @app.get("/api/v1/health")
@@ -83,13 +67,7 @@ async def call_service(
     body: dict = Body(default={}),
     timeout: float = Query(default=10.0, gt=0, le=120),
 ):
-    """Call any ROS 2 service on the microscope.
-
-    `service_path` is relative to /scopio (e.g. `stage/jog`); the JSON body
-    maps to the service's request fields (see /api/v1/interfaces). A float
-    field you leave out is sent as NaN, which every SCOPIO service reads as
-    "leave this one alone" -- so a partial body is safe (see conversion.py).
-    """
+    """Call any ROS 2 service under /scopio (e.g. stage/jog); an omitted float field means "leave unchanged"."""
     try:
         return await bridge.call_service(service_path, body, timeout=timeout)
     except UnknownInterface as exc:
@@ -106,8 +84,7 @@ async def call_service(
 # ------------------------------------------------------------------ camera
 @app.get("/api/v1/stream.mjpg", dependencies=[Depends(require_api_key)])
 async def stream_mjpg():
-    """Live MJPEG video. Usable directly as an <img src=...> (append
-    ?api_key=...) or ingested programmatically (scopio_client.stream_frames)."""
+    """Live MJPEG video; usable as an <img src> with ?api_key=."""
     return await camera_proxy.mjpeg_stream()
 
 
@@ -119,6 +96,12 @@ async def get_camera_controls():
 @app.post("/api/v1/camera/controls", dependencies=[Depends(require_api_key)])
 async def set_camera_controls(body: dict = Body(default={})):
     return await camera_proxy.forward("POST", "/controls", json_body=body)
+
+
+@app.post("/api/v1/camera/mode", dependencies=[Depends(require_api_key)])
+async def set_camera_mode(body: dict = Body(default={})):
+    """Switch the sensor between 'detail' (full field of view) and 'fast' (highest fps); see `modes` in controls."""
+    return await camera_proxy.forward("POST", "/mode", json_body=body)
 
 
 @app.post("/api/v1/camera/white_balance", dependencies=[Depends(require_api_key)])

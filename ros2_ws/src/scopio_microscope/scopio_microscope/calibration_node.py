@@ -1,26 +1,4 @@
-"""calibration_node - owns the microscope's spatial calibration.
-
-The single source of truth for how pixels and steps map to micrometres:
-  * um_per_px      - image scale (micrometres per native camera pixel)
-  * steps_per_um_* - stage conversion (Sangaboard steps per micrometre per axis)
-
-It publishes the calibration on a LATCHED (transient-local) topic so any client
--- including the stage_node, which needs steps_per_um to report its position in
-micrometres -- gets the current value immediately on join.
-
-PERSISTENCE. The file lives on the Pi's real disk, not in the container: compose
-bind-mounts the repo at /workspace and runs the graph there, so the default
-relative path resolves onto the host and survives `docker compose down`, image
-rebuilds and reboots. The node logs the ABSOLUTE path it resolved at startup --
-if that ever reads as a path inside the container, the mount is what broke, not
-this node. Writes are atomic (temp file + os.replace), so power going out
-mid-write cannot leave a truncated file that silently reads back as "no
-calibration".
-
-Topics / services (under /scopio):
-  pub  calibration       scopio_interfaces/Calibration   (latched)
-  srv  calibration/set   scopio_interfaces/CalibrationSet
-"""
+"""calibration_node - the persisted spatial calibration, on a latched topic (see ../README.md)."""
 
 import json
 import math
@@ -42,6 +20,9 @@ class CalibrationNode(Node):
 
         self.data = {
             "um_per_px": None,
+            # Without both, the scale cannot be converted when the sensor mode changes.
+            "um_per_px_width": 0,
+            "um_per_px_window": 0,
             "steps_per_um": {"x": 1.0, "y": 1.0, "z": 1.0},
         }
         self._load()
@@ -61,9 +42,7 @@ class CalibrationNode(Node):
             self.get_logger().info("No calibration file yet; using defaults.")
             return
         except (OSError, ValueError) as exc:
-            # Loud on purpose: an unreadable file looks exactly like "the
-            # calibration did not persist", and silence sends you hunting the
-            # volume mount instead of the one bad file.
+            # Loud: silence here looks like a broken volume mount instead of one bad file.
             self.get_logger().error(
                 f"Calibration file {self.path} is unreadable ({exc}); using "
                 "defaults. Fix or delete it -- the next calibration/set "
@@ -72,6 +51,8 @@ class CalibrationNode(Node):
         try:
             if d.get("um_per_px") is not None:
                 self.data["um_per_px"] = float(d["um_per_px"])
+                self.data["um_per_px_width"] = int(d.get("um_per_px_width") or 0)
+                self.data["um_per_px_window"] = int(d.get("um_per_px_window") or 0)
             spu = d.get("steps_per_um") or {}
             for ax in ("x", "y", "z"):
                 if ax in spu:
@@ -105,24 +86,26 @@ class CalibrationNode(Node):
         upp = self.data["um_per_px"]
         msg.has_um_per_px = upp is not None
         msg.um_per_px = float(upp) if upp is not None else 0.0
+        msg.um_per_px_width = int(self.data["um_per_px_width"])
+        msg.um_per_px_window = int(self.data["um_per_px_window"])
         msg.steps_per_um_x = float(self.data["steps_per_um"]["x"])
         msg.steps_per_um_y = float(self.data["steps_per_um"]["y"])
         msg.steps_per_um_z = float(self.data["steps_per_um"]["z"])
         self.pub.publish(msg)
 
     def _on_set(self, request, response):
-        """Every field is a positive scale factor, so NaN *or* 0 (an omitted
-        field on a partially-filled request) means "leave this one alone"."""
+        """Every field is a positive scale, so NaN or 0 means "leave this one alone"."""
         fields = {"um_per_px": request.um_per_px,
                   "x": request.steps_per_um_x,
                   "y": request.steps_per_um_y,
                   "z": request.steps_per_um_z}
         given = {k: float(v) for k, v in fields.items()
                  if not math.isnan(v) and v != 0.0}
-        bad = [k for k, v in given.items() if v < 0]
+        # isfinite: inf passes `v < 0` and would zero every stage micrometre reading.
+        bad = [k for k, v in given.items() if v < 0 or not math.isfinite(v)]
         if bad:
             response.success = False
-            response.message = f"must be > 0: {', '.join(sorted(bad))}"
+            response.message = f"must be finite and > 0: {', '.join(sorted(bad))}"
             return response
         if not given:
             response.success = False
@@ -131,6 +114,11 @@ class CalibrationNode(Node):
 
         if "um_per_px" in given:
             self.data["um_per_px"] = given["um_per_px"]
+            # Travels with the scale; 0 keeps the old value, for a client too old to send it.
+            if request.um_per_px_width > 0:
+                self.data["um_per_px_width"] = int(request.um_per_px_width)
+            if request.um_per_px_window > 0:
+                self.data["um_per_px_window"] = int(request.um_per_px_window)
         for ax in ("x", "y", "z"):
             if ax in given:
                 self.data["steps_per_um"][ax] = given[ax]

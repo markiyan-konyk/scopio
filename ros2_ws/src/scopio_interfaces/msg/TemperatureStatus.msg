@@ -1,10 +1,4 @@
-# Sample temperature controller (Wavelength Electronics TC10 LAB), polled by
-# temperature_node. Carries what a control loop actually needs: the reading AND
-# the setpoint it is chasing, the TEC drive, and the fault flags -- which is why
-# this is not sensor_msgs/Temperature (see INTERFACES.md).
-#
-# temperature/setpoint/limits are in `units`; the node forces the units on
-# connect so degrees are never ambiguous.
+# TC10 LAB state for a control loop (reading, setpoint, drive, faults), polled; temperatures are in `units`.
 std_msgs/Header header
 bool connected
 string idn            # *IDN? of the connected controller

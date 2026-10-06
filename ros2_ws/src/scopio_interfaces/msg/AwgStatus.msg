@@ -1,7 +1,4 @@
-# Status of the galvo/laser AWG, which the galvo_node drives as a raw VISA/SCPI
-# passthrough. The node does NOT interpret command meaning (no volts/pixels) --
-# laser geometry lives in client code. This just reports liveness and the last
-# command relayed, so clients can confirm the link.
+# Liveness of the galvo AWG link, published on awg/status; the node does not interpret commands.
 std_msgs/Header header
 bool connected
 string idn            # *IDN? response of the connected instrument

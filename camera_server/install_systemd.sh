@@ -1,12 +1,5 @@
 #!/bin/bash
-# Install the SCOPIO camera server as a systemd unit on the Pi host.
-# FALLBACK path -- use only if the `camera` docker compose service fails
-# (libcamera/kernel mismatch inside the container). Run ON THE PI:
-#
-#   cd camera_server && sudo ./install_systemd.sh
-#
-# Then disable the compose service:  docker compose stop camera  (and comment
-# it out of ros2_ws/docker-compose.yml so `up` doesn't restart it).
+# Install the camera server as a systemd unit, the fallback when libcamera fails in the container (see README.md).
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"

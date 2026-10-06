@@ -1,6 +1,4 @@
-# Relative jog of the stage by a displacement in Sangaboard steps. This is the
-# simple, low-latency move the UI press-and-hold uses (step SIZE is a client
-# concern -- the client sends the actual delta it wants).
+# Move the stage by a relative displacement in steps; step size is the client's choice.
 int32 dx
 int32 dy
 int32 dz

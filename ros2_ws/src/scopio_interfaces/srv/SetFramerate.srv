@@ -1,6 +1,4 @@
-# Set the capture frame rate. The camera_node derives the exposure and the
-# analogue gain needed to achieve it without darkening (the "exposure budget"
-# math) and returns the values it applied.
+# Set the capture frame rate; the node derives exposure and gain to keep the brightness.
 float64 fps
 ---
 bool success

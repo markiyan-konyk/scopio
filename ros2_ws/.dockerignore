@@ -4,3 +4,5 @@ log/
 **/__pycache__/
 **/*.pyc
 secrets/
+# Runtime state (calibration.json): mounted at run time, never baked in.
+data/

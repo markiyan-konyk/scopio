@@ -1,24 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end smoke test of the SCOPIO API gateway.
-
-Needs only `pip install requests websocket-client` (or the scopio_client SDK's
-deps). Run against:
-
-  * the no-hardware dev stack (docker-compose.dev.yml) on a laptop:
-        python3 scripts/smoke_test_api.py --url http://127.0.0.1:8000
-    (use 127.0.0.1, not localhost -- on Windows/Docker Desktop the WebSocket
-    connect can hang on the IPv6 localhost route)
-  * the real Pi (add --hardware once the rig is attached):
-        python3 scripts/smoke_test_api.py --url http://<pi>:8000 --hardware
-
-The key is read from --key, $SCOPIO_API_KEY, or ros2_ws/secrets/api_keys.json
-(first key found), in that order.
-
-Without --hardware it asserts the DEGRADED behaviors (this is deliberate: it
-proves the full JSON->gateway->ROS->response path against nodes that have no
-hardware). With --hardware it additionally does a +-0-step stage jog
-round-trip, an AWG *IDN? query, and checks live MJPEG frames.
-"""
+"""End-to-end smoke test of the SCOPIO API gateway; needs requests and websocket-client (see README.md)."""
 
 import argparse
 import json
@@ -111,10 +92,7 @@ def main():
         check("AWG degraded gracefully", resp.get("success") is False,
               str(resp.get("error", ""))[:60])
 
-    # 4b. the instrument-call surface. list_methods is answered by the NODE
-    #     (introspecting the driver class), so it proves the whole path even
-    #     with no controller attached -- and tells you the node is the version
-    #     you think it is.
+    # 4b. instrument calls: the node answers list_methods even with no controller attached.
     r = requests.post(f"{base}/api/v1/service/temperature/call", headers=H,
                       json={"method": "list_methods"}, timeout=20)
     resp = r.json() if r.status_code == 200 else {}
@@ -152,9 +130,7 @@ def main():
                       json={"bogus_field": 1}, timeout=10)
     check("bad fields -> 422", r.status_code == 422, f"got {r.status_code}")
 
-    # 5. the NaN rule: null on float fields must not error and must mean
-    #    "leave unchanged" (response success=False without hardware is fine --
-    #    the point is it parses and reaches the node).
+    # 5. the NaN rule: null on float fields must parse and reach the node.
     body = {"contrast": 1.2, "red_gain": None, "green_gain": None,
             "blue_gain": None, "colour_gain": None, "analogue_gain": None,
             "saturation": None, "brightness": None, "sharpness": None}

@@ -1,32 +1,4 @@
-"""JSON <-> ROS 2 message conversion for the gateway.
-
-Two directions:
-
-  build_msg(cls, data)  -- JSON dict -> ROS message instance (for service
-                           requests, published messages and action goals).
-  msg_to_jsonable(msg)  -- ROS message -> plain JSON-safe python structure.
-
-THE NaN RULE (important, documented in docs/API.md):
-Several SCOPIO interfaces (SetCameraControls, CalibrationSet) use NaN as the
-"leave this field unchanged" sentinel. JSON has no NaN, and a float field left
-out of the request would otherwise be built as 0.0 -- which is not "unchanged",
-it is a command to set that gain to zero. So on the way IN:
-
-  * JSON null (or the string "nan") on a float/double field -> NaN
-  * a float field ABSENT from a SERVICE REQUEST             -> NaN
-  * a float field absent from an ACTION GOAL or a published
-    message                                                 -> 0.0 (the default)
-
-Services are the ones that take partial "set this subset" bodies, and EVERY
-float field in the frozen contract belongs to such a service (SetCameraControls,
-CalibrationSet, SetFramerate) -- everything where 0 is a meaningful value
-(positions, ranges, step counts) is an integer. Action goals are complete
-requests where an absent `settle_s` genuinely means "don't pause", so they keep
-the plain default. That is why `nan_for_missing` is a per-call flag rather than
-a property of the field type.
-
-On the way OUT, NaN/inf become null (JSON-safe).
-"""
+"""JSON <-> ROS message conversion; an omitted float in a service request becomes NaN (see README.md)."""
 
 import math
 from collections import OrderedDict
@@ -36,8 +8,7 @@ from rosidl_runtime_py.utilities import get_message
 
 FLOAT_TYPES = ("float", "double", "float32", "float64")
 
-# Topics whose messages are far too large to serialize as JSON over the
-# generic WebSocket path. Video is served properly at /api/v1/stream.mjpg.
+# Too large for JSON over the WebSocket; video is served at /api/v1/stream.mjpg.
 BULKY_TYPES = {
     "sensor_msgs/msg/CompressedImage",
     "sensor_msgs/msg/Image",
@@ -109,15 +80,7 @@ def _prepare(data, msg_cls, nan_for_missing=False):
 
 
 def build_msg(msg_cls, data, nan_for_missing=False):
-    """Build a ROS message of type msg_cls from a JSON-derived dict.
-
-    nan_for_missing=True fills every float field the body left out with NaN --
-    used for service requests, where omitting a field means "leave it alone".
-    It must run even for an EMPTY body: `POST camera/set_controls {}` has to be
-    a no-op, not "set every colour gain to zero".
-
-    Raises ValueError with a readable message on bad/unknown fields.
-    """
+    """Build a msg_cls from a JSON dict; nan_for_missing makes omitted floats NaN, even for {}."""
     msg = msg_cls()
     if data or nan_for_missing:
         try:

@@ -1,0 +1,19 @@
+# Secrets and per-rig config -- they live on the Pi only, NEVER in git.
+ros2_ws/secrets/
+.env
+
+# Runtime state written by the running backend, not source.
+ros2_ws/data/
+calibration.json
+
+# colcon build products
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.venv/

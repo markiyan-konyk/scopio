@@ -1,40 +1,4 @@
-"""WebSocket endpoint: live topic streams + long-running actions.
-
-Endpoint:  WS /api/v1/ws?api_key=<key>     (header X-API-Key also accepted)
-
-Every frame in both directions is a JSON object with an "op". The client picks
-an "id" per request; all server frames about that request echo the same id.
-
-  client -> server
-    {"op":"subscribe",  "id":"s1", "topic":"stage/position", "rate_hz":10}
-    {"op":"unsubscribe","id":"s1"}
-    {"op":"publish",    "id":"p1", "topic":"some/topic",
-                        "type":"pkg/msg/Type",   # optional if topic is live
-                        "msg":{...}}
-    {"op":"action_send_goal", "id":"g1", "action":"camera/autofocus",
-                              "goal":{"z_range":2000,"steps":15,"settle_s":0.2}}
-    {"op":"action_cancel",    "id":"g1"}
-
-  server -> client
-    {"op":"ok",    "id":"s1"}
-    {"op":"error", "id":"s1", "code":"...", "detail":"..."}
-    {"op":"message","id":"s1","topic":"stage/position","stamp":..., "msg":{...}}
-    {"op":"action_ack",     "id":"g1", "accepted":true}
-    {"op":"action_feedback","id":"g1", "feedback":{...}}
-    {"op":"action_result",  "id":"g1", "status":"succeeded|aborted|canceled",
-                            "result":{...}}
-
-error codes: unauthorized | bad_request | unknown_topic | unknown_action |
-             use_mjpeg | bad_fields | timeout
-
-Notes:
-  * Video topics (CompressedImage/Image) are refused with use_mjpeg -- fetch
-    /api/v1/stream.mjpg instead. Everything else streams fine as JSON.
-  * rate_hz decimates server-side (drop, not queue) so slow clients never
-    backpressure the ROS executor. The outbound queue also drops on overflow.
-  * Closing the socket destroys subscriptions but does NOT cancel running
-    action goals (ROS semantics: a goal outlives its caller unless canceled).
-"""
+"""WebSocket endpoint: topic streams, publishing and actions (protocol in docs/API.md)."""
 
 import asyncio
 import time
@@ -114,7 +78,14 @@ def _handle_subscribe(conn, req):
                     "stream GET /api/v1/stream.mjpg instead")
 
     rate_hz = req.get("rate_hz")
-    min_interval = (1.0 / float(rate_hz)) if rate_hz else 0.0
+    try:
+        rate_hz = float(rate_hz) if rate_hz else 0.0
+    except (TypeError, ValueError):
+        rate_hz = -1.0
+    if rate_hz < 0:
+        return _err(conn, msg_id, "bad_request",
+                    "rate_hz must be a positive number (or omitted for every message)")
+    min_interval = (1.0 / rate_hz) if rate_hz else 0.0
     last_sent = [0.0]
 
     def _cb(jsonable):  # executor thread
@@ -249,6 +220,22 @@ async def _handle_action_cancel(conn, req):
         _err(conn, msg_id, "timeout", "cancel not acknowledged")
 
 
+async def _dispatch(conn, req):
+    op = req.get("op")
+    if op == "subscribe":
+        _handle_subscribe(conn, req)
+    elif op == "unsubscribe":
+        _handle_unsubscribe(conn, req)
+    elif op == "publish":
+        _handle_publish(conn, req)
+    elif op == "action_send_goal":
+        await _handle_action_send_goal(conn, req)
+    elif op == "action_cancel":
+        await _handle_action_cancel(conn, req)
+    else:
+        _err(conn, req.get("id"), "bad_request", f"unknown op '{op}'")
+
+
 async def websocket_endpoint(websocket: WebSocket):
     presented = (websocket.query_params.get("api_key")
                  or websocket.headers.get("x-api-key"))
@@ -272,22 +259,17 @@ async def websocket_endpoint(websocket: WebSocket):
             try:
                 req = await websocket.receive_json()
             except ValueError:
+                req = None
+            if not isinstance(req, dict):
                 conn.push({"op": "error", "id": None, "code": "bad_request",
                            "detail": "frames must be JSON objects"})
                 continue
-            op = req.get("op")
-            if op == "subscribe":
-                _handle_subscribe(conn, req)
-            elif op == "unsubscribe":
-                _handle_unsubscribe(conn, req)
-            elif op == "publish":
-                _handle_publish(conn, req)
-            elif op == "action_send_goal":
-                await _handle_action_send_goal(conn, req)
-            elif op == "action_cancel":
-                await _handle_action_cancel(conn, req)
-            else:
-                _err(conn, req.get("id"), "bad_request", f"unknown op '{op}'")
+            # One bad request costs one error envelope, never the connection.
+            try:
+                await _dispatch(conn, req)
+            except Exception as exc:
+                _err(conn, req.get("id"), "bad_request",
+                     f"{type(exc).__name__}: {exc}")
     except WebSocketDisconnect:
         pass
     finally:

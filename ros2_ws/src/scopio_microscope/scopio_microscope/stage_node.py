@@ -1,21 +1,4 @@
-"""stage_node - owns the Sangaboard XYZ stage.
-
-Publishes the microscope's global (open-loop) position and executes long-horizon
-motion goals. It re-implements the small amount of stage logic leanly for ROS
-rather than importing the Flask app's controls.py (which carries app-global
-state).
-
-Topics / services / actions (under /scopio):
-  pub     stage/position    scopio_interfaces/StagePosition  (steps + micrometres)
-  sub     calibration       scopio_interfaces/Calibration (latched; steps_per_um)
-  srv     stage/jog         scopio_interfaces/StageJog    (relative jog, low latency)
-  srv     stage/move_abs    scopio_interfaces/MoveAbs     (single absolute move)
-  action  stage/move_path   scopio_interfaces/MoveStagePath
-  action  scan_region       scopio_interfaces/ScanRegion
-
-Degrades gracefully: with no board present it publishes connected=false and
-move goals/services abort cleanly.
-"""
+"""stage_node - the Sangaboard XYZ stage, in open-loop steps (see ../README.md)."""
 
 import os
 import threading
@@ -33,18 +16,14 @@ from scopio_interfaces.srv import MoveAbs, StageJog
 from scopio_interfaces.action import MoveStagePath, ScanRegion
 
 
-# The Sangaboard v0.5 is an RP2040 HAT: it sits on the 40-pin header and talks
-# over the Pi's UART, so it has NO USB vendor/product id. The library's
-# auto-detection scans USB serial devices, which means a header-mounted board is
-# powered, wired and working yet can never be found -- naming the port is the
-# only way. /dev/serial0 is the Pi's alias for whichever UART is on pins 8/10.
+# A v0.5 HAT talks over the header UART with no USB id, so auto-detection can never find it.
 GPIO_UART_PORTS = ("/dev/serial0", "/dev/ttyAMA0", "/dev/ttyS0")
+
+MAX_FAILURES = 3      # consecutive failed moves before the board is re-opened
 
 
 def serial_ports():
-    """Every serial port visible here. This list IS the diagnosis: empty means
-    the board is not reaching this process at all; a port that is present means
-    auto-detection did not recognise it, and naming it fixes that."""
+    """Every serial port visible here: the diagnosis when the board is not found."""
     try:
         from serial.tools import list_ports
         found = [f"{p.device} [{p.vid:04x}:{p.pid:04x}] {p.description}"
@@ -52,8 +31,7 @@ def serial_ports():
                  for p in list_ports.comports()]
     except Exception as exc:
         found = [f"<pyserial unavailable: {type(exc).__name__}: {exc}>"]
-    # comports() reports USB serial devices; the header UART may not appear
-    # there at all, so check it directly -- that is where a HAT lives.
+    # comports() may not list the header UART, where a HAT lives, so check it directly.
     header = [p for p in GPIO_UART_PORTS if os.path.exists(p)]
     if header:
         found.append(f"GPIO header UART present: {header}")
@@ -70,16 +48,15 @@ class StageNode(Node):
         self.declare_parameter("step_y", 40)
         self.declare_parameter("step_z", 40)
 
-        # One lock for both the session and the moves: never swap the board out
-        # from under a move in progress.
+        # One lock for the session and the moves: never swap the board out mid-move.
         self._lock = threading.RLock()
         self.sb = None
+        self._failures = 0                          # consecutive failed moves
         self.position = {"x": 0, "y": 0, "z": 0}   # open-loop, origin at startup
         self.steps_per_um = {"x": 1.0, "y": 1.0, "z": 1.0}  # from calibration topic
 
         self._connect()
-        # Every other instrument node retries; this one used to open the board
-        # exactly once, so a stage plugged in after launch stayed dead forever.
+        # Retry, so a stage plugged in after launch comes up.
         period = max(2.0, float(self.get_parameter("reconnect_period").value))
         self.create_timer(period, self._retry_connect)
 
@@ -110,13 +87,7 @@ class StageNode(Node):
 
     # ------------------------------------------------------------------ #
     def _connect(self):
-        """Open the board. SANGABOARD_PORT env > `port` param > auto-detection.
-
-        Auto-detection only ever finds a board on USB. A v0.5 HAT on the 40-pin
-        header speaks the Pi's UART and has no USB identity at all, so it is
-        invisible to it -- hence the explicit port, and hence the header UARTs
-        being tried before giving up.
-        """
+        """Open the board: SANGABOARD_PORT env > `port` param > auto-detection > the header UARTs."""
         port = (os.environ.get("SANGABOARD_PORT")
                 or self.get_parameter("port").value or "").strip()
         with self._lock:
@@ -152,6 +123,24 @@ class StageNode(Node):
     def _retry_connect(self):
         if self.sb is None:
             self._connect()
+
+    def _note_failure(self, exc):
+        """Count a failed move; MAX_FAILURES in a row drop the board so the retry timer reopens it."""
+        self._failures += 1
+        if self._failures < MAX_FAILURES:
+            return
+        with self._lock:
+            sb, self.sb = self.sb, None
+            self._failures = 0
+        try:
+            if sb is not None and hasattr(sb, "close"):
+                sb.close()
+        except Exception:
+            pass
+        self.get_logger().warning(
+            f"Sangaboard dropped after {MAX_FAILURES} failed moves ({exc}); "
+            "will reconnect. Position is kept: it is only valid if the board "
+            "was not power-cycled meanwhile.")
 
     def _on_calibration(self, msg):
         self.steps_per_um = {"x": msg.steps_per_um_x or 1.0,
@@ -201,17 +190,25 @@ class StageNode(Node):
 
     def _move_rel(self, dx, dy, dz):
         """Move by a relative displacement (steps) and track absolute position."""
-        if self.sb is None:
-            raise RuntimeError("Sangaboard unavailable")
         with self._lock:
-            self.sb.move_rel([int(dx), int(dy), int(dz)])
+            # Checked under the lock, so a retry-connect cannot swap the board in between.
+            if self.sb is None:
+                raise RuntimeError("Sangaboard unavailable")
+            try:
+                self.sb.move_rel([int(dx), int(dy), int(dz)])
+            except Exception as exc:
+                self._note_failure(exc)
+                raise
+            self._failures = 0
             self.position["x"] += int(dx)
             self.position["y"] += int(dy)
             self.position["z"] += int(dz)
 
     def _move_abs(self, x, y, z):
-        self._move_rel(x - self.position["x"], y - self.position["y"],
-                       z - self.position["z"])
+        # Delta inside the lock: a jog landing between read and move would be lost for good (open-loop).
+        with self._lock:
+            self._move_rel(x - self.position["x"], y - self.position["y"],
+                           z - self.position["z"])
 
     # ------------------------------------------------------------------ #
     #  Action: move along a path of absolute targets

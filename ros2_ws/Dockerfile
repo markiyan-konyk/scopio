@@ -1,13 +1,4 @@
-# SCOPIO microscope ROS 2 node, all-in-one container.
-#
-# Base: ROS 2 Jazzy (Ubuntu 24.04 Noble). The container owns the camera
-# (picamera2/libcamera), the galvo (USB) and the stage (serial), so it runs
-# --privileged with host networking and device passthrough (see compose).
-#
-# The libcamera/picamera2 apt packages must match the Pi's kernel/firmware --
-# this is the one piece to verify on the Pi (see README "Camera caveat"). If the
-# apt package is unavailable on your image, the camera node degrades gracefully
-# (the rest of the graph still comes up) until it's sorted.
+# SCOPIO nodes and gateway: ROS 2 Jazzy on Ubuntu 24.04. The build layers are explained in README.md.
 FROM ros:jazzy-ros-base
 
 SHELL ["/bin/bash", "-lc"]
@@ -23,31 +14,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ros-jazzy-sensor-msgs \
         ros-jazzy-std-srvs \
     && rm -rf /var/lib/apt/lists/*
-# libusb-1.0-0 is REQUIRED for pyvisa-py/pyusb to enumerate USB-TMC instruments
-# (the Rigol AWG that steers the galvo, and the TC LAB temperature controller
-# when it is on USB rather than Ethernet). Without it the container sees only
-# serial ports and those nodes report unavailable -- the host has libusb so the
-# standalone bench scripts work there, but the Ubuntu container needs it
-# installed explicitly.
+# libusb-1.0-0: without it pyvisa-py cannot enumerate USB instruments (the AWG and the TC10).
+# No picamera2/libcamera: they exist only for Raspberry Pi OS, so the camera has its own container.
 
-# NOTE: picamera2 / libcamera are NOT in Ubuntu's ARM repos -- they ship from
-# Raspberry Pi OS (Debian). So they are intentionally NOT installed here. The
-# camera is owned by the separate `camera` compose service (camera_server/,
-# Debian bookworm + the Raspberry Pi apt archive) and camera_node falls back to
-# BRIDGE MODE: it ingests the camera server's MJPEG stream over loopback HTTP,
-# republishes frames on image/compressed, and forwards the camera services to
-# the camera server's HTTP API. See camera_server/README.md.
-
-# Python deps for the hardware drivers. --break-system-packages because Noble's
-# Python is PEP-668 "externally managed"; fine inside a container.
-# NOTE: no Flask here -- this image is the headless BACKEND. The web UI is a
-# separate app (../ui) that talks to the gateway over plain HTTP.
-# NO image-analysis stack either (no trackpy/pandas/scipy): the backend senses,
-# streams and effectuates -- it never analyses frames. Bead detection/tracking
-# runs on the CLIENT side, off the Pi (viscosity/, viscosity_agent/). Keeping it
-# out also keeps the image off the apt-numpy-vs-pip-numpy collision entirely.
+# Not yet version-pinned. --break-system-packages: Noble's Python is PEP-668 managed; fine in a container.
 RUN pip3 install --no-cache-dir --break-system-packages \
-        simplejpeg \
         pyvisa \
         pyvisa-py \
         pyusb \
@@ -57,30 +28,25 @@ RUN pip3 install --no-cache-dir --break-system-packages \
         fastapi \
         "uvicorn[standard]" \
         httpx
-# fastapi/uvicorn/httpx power the scopio_gateway package (the HTTP/WebSocket
-# API that external clients use instead of joining the DDS graph). They are
-# pure-python and light -- fine on the Pi.
-# pyserial is listed EXPLICITLY even though sangaboard pulls it in: pyvisa-py
-# cannot enumerate or open a single ASRL (serial / USB virtual-COM) instrument
-# without it, and inheriting that from another package's dependency tree is how
-# you end up debugging an instrument that "VISA can't see" for an afternoon.
+# pyserial is explicit: pyvisa-py needs it for serial instruments, not only sangaboard.
 
-# Build the workspace (interfaces + nodes) into the image.
-#
-# THE NODES RUN FROM THIS IMAGE, not from the repo mounted at /workspace. The
-# mount only supplies the working directory (calibration.json). So editing a
-# node on the Pi and running `docker compose up -d` changes NOTHING -- you need
-# `--build`. That failure is silent and looks exactly like a broken fix, so the
-# build is stamped and the stamp is printed at launch. Docker caches this layer
-# with the COPY above it: same source, same stamp; changed source, new stamp.
+# ---- The workspace, in layers ordered by how rarely they change ----------------
+# The nodes run from this image, never from the repo: after an edit, `docker compose up -d --build`.
 WORKDIR /ros2_ws
-COPY . /ros2_ws/
-RUN date -u +'%Y-%m-%dT%H:%M:%SZ' > /ros2_ws/BUILD_STAMP
-RUN source /opt/ros/jazzy/setup.bash && colcon build --symlink-install
+# 1. Interfaces alone: by far the slowest compile; -j2 so the Pi does not swap to the SD card.
+COPY src/scopio_interfaces /ros2_ws/src/scopio_interfaces
+RUN source /opt/ros/jazzy/setup.bash \
+    && MAKEFLAGS=-j2 colcon build --symlink-install --packages-select scopio_interfaces
 
-# The nodes import nothing from outside this workspace. The repo is still
-# mounted at /workspace at runtime and used as the working directory, so
-# relative paths (calibration.json) land on the Pi's real disk.
+# 2. Nodes and gateway; --packages-skip scopio_interfaces reuses layer 1. The stamp is printed at launch.
+COPY src /ros2_ws/src
+RUN date -u +'%Y-%m-%dT%H:%M:%SZ' > /ros2_ws/BUILD_STAMP
+RUN source /opt/ros/jazzy/setup.bash && source /ros2_ws/install/setup.bash \
+    && colcon build --symlink-install --packages-skip scopio_interfaces
+
+# 3. Scripts last; in the container run them by absolute path (the working directory is /data).
+COPY scripts /ros2_ws/scripts
+
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 
 COPY entrypoint.sh /entrypoint.sh

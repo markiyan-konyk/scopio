@@ -1,33 +1,5 @@
 #!/usr/bin/env python3
-"""Camera stream + control server for the Raspberry Pi (SCOPIO).
-
-WHY THIS EXISTS
----------------
-picamera2/libcamera ship from Raspberry Pi OS, NOT Ubuntu, so the camera cannot
-live inside the Ubuntu ROS container. It lives here instead -- the SINGLE OWNER
-of the sensor -- and everything else consumes it over loopback HTTP:
-
-  GET  /stream.mjpg   -> live MJPEG video
-  GET  /controls      -> current camera settings (incl. live exposure/gain)
-  POST /controls      -> set framerate/exposure/gain/colour/contrast/... (JSON)
-  POST /white_balance -> one-shot auto white balance; locks the measured gains
-  GET  /focus         -> a focus metric (JPEG size)
-
-Consumers (both on 127.0.0.1 -- this server is deliberately loopback-only):
-  * the API gateway (scopio_gateway) proxies /stream.mjpg and the controls to
-    authenticated external clients;
-  * camera_node (ROS) ingests the stream in BRIDGE mode and republishes it on
-    image/compressed + forwards the camera services here.
-
-HOW IT RUNS (pick one; identical HTTP surface either way):
-  * as the `camera` service in ros2_ws/docker-compose.yml (default -- comes up
-    with the rest of the backend automatically), or
-  * as a systemd unit on the Pi host if libcamera misbehaves in-container:
-        camera_server/install_systemd.sh
-
-Env: CAM_HOST (127.0.0.1), CAM_PORT (8081), CAM_W (640), CAM_H (480).
-Requires: python3-picamera2 (Raspberry Pi OS Bookworm / the RPi apt archive).
-"""
+"""MJPEG stream and control server, the single owner of the Pi camera (see README.md)."""
 
 import io
 import os
@@ -42,26 +14,66 @@ from picamera2 import Picamera2
 from picamera2.encoders import MJPEGEncoder
 from picamera2.outputs import FileOutput
 
-# Loopback by default: this server has NO auth, so it must never face the LAN.
-# The API gateway is the authenticated front door.
+# Loopback by default: this server has no auth, so it must never face the LAN.
 HOST = os.environ.get("CAM_HOST", "127.0.0.1")
 PORT = int(os.environ.get("CAM_PORT", 8081))
 SIZE = (int(os.environ.get("CAM_W", 640)), int(os.environ.get("CAM_H", 480)))
 
 picam2 = None
-# Why the sensor is not open, and what libcamera could actually see when it was
-# last tried. Both are reported in the 503 body -- an empty camera list is THE
-# diagnostic (picamera2 imported fine, libcamera loaded, the sensor just is not
-# visible to this process).
+# Why the sensor is not open, and what libcamera last saw; both go in the 503 body.
 camera_error = "camera not opened yet"
 camera_list = []
+_mode_lock = threading.Lock()      # one reconfigure at a time
+
+# The ISP scales the full-FOV detail mode down to this width; MJPEG of more will not keep up on a LAN.
+DETAIL_MAX_W = int(os.environ.get("CAM_DETAIL_MAX_W", 1640))
 
 # Last-commanded settings, echoed back by GET /controls (merged with live metadata).
 state = {
     "framerate": 30.0, "exposure": 20000, "analogue_gain": 1.0,
     "red_gain": 2.4, "blue_gain": 2.5, "green_gain": 1.0, "colour_gain": 1.0,
     "contrast": 1.0, "saturation": 1.0, "brightness": 0.0, "sharpness": 1.0,
+    # Which of the two sensor modes is running, and what it is delivering.
+    "mode": os.environ.get("CAM_MODE", "detail"), "width": SIZE[0], "height": SIZE[1],
+    "window": SIZE[0],   # sensor pixels across the frame; see pick_modes
 }
+# Filled in when the sensor opens: {"detail": {...}, "fast": {...}}.
+available_modes = {}
+
+
+def pick_modes(sensor_modes, max_detail_w=None):
+    """Pick 'detail' (fastest full-FOV mode) and 'fast' (highest fps) from the advertised modes."""
+    modes = [m for m in (sensor_modes or []) if m.get("size")]
+    if not modes:
+        return {}
+
+    def area(size):
+        return size[0] * size[1]
+
+    def window(m):
+        crop = m.get("crop_limits")
+        return area(m["size"]) if not crop else crop[2] * crop[3]
+
+    def fps(m):
+        return float(m.get("fps") or 0.0)
+
+    widest = max(window(m) for m in modes)
+    full_fov = [m for m in modes if window(m) == widest]
+
+    def spec(m, cap=None):
+        w, h = m["size"]
+        if cap and w > cap:                     # scale down, keep the aspect
+            w, h = cap, max(1, round(h * cap / m["size"][0]))
+        crop = m.get("crop_limits")
+        return {"sensor": list(m["size"]), "size": [w, h], "fps": round(fps(m), 1),
+                "full_fov": window(m) == widest,
+                # um/px depends on window/size, not size alone: a crop keeps the scale.
+                "window": [crop[2], crop[3]] if crop else [m["size"][0], m["size"][1]]}
+
+    # The fastest full-FOV mode, not the biggest: 3280x2464 runs near 21 fps and gets scaled down anyway.
+    detail = max(full_fov, key=lambda m: (fps(m), area(m["size"])))
+    fastest = max(modes, key=lambda m: (fps(m), -area(m["size"])))
+    return {"detail": spec(detail, max_detail_w), "fast": spec(fastest)}
 
 
 _warned_unsupported = set()
@@ -77,15 +89,7 @@ def _num(v):
 
 
 def supported(controls):
-    """Keep only the controls THIS sensor advertises.
-
-    Not every camera has every control: a monochrome sensor has no AwbEnable or
-    ColourGains (no Bayer filter, so there is nothing to white-balance), and some
-    sensors lack Saturation or Sharpness. picamera2 raises on the FIRST unknown
-    key, so one unsupported control used to reject the whole request -- and the
-    caller then retried it forever. Dropping is right: the request is still
-    meaningful, that one knob simply does not exist on this hardware.
-    """
+    """Keep only the controls this sensor advertises; picamera2 rejects a whole request on one unknown key."""
     known = set(picam2.camera_controls) if picam2 is not None else set()
     dropped = set(controls) - known
     for name in sorted(dropped - _warned_unsupported):
@@ -96,13 +100,13 @@ def supported(controls):
 
 
 def apply_controls(d):
-    """Apply a partial dict of settings to the camera. Keys match the UI:
-    framerate, exposure, analogue_gain, red_gain, blue_gain, contrast,
-    saturation, brightness, sharpness."""
+    """Apply a partial dict of settings (framerate, exposure, gains, image controls)."""
     c = {}
     fps = _num(d.get("framerate"))
     if fps:
-        fps = max(1.0, min(120.0, fps))
+        # The running mode's own ceiling: libcamera clamps silently, and state would then lie.
+        ceiling = (available_modes.get(state["mode"], {}).get("fps") or 120.0)
+        fps = max(1.0, min(float(ceiling), fps))
         dur = int(1_000_000 / fps)
         c["FrameDurationLimits"] = (dur, dur)
         state["framerate"] = fps
@@ -116,8 +120,7 @@ def apply_controls(d):
         c["AeEnable"] = False
         c["AnalogueGain"] = ag
         state["analogue_gain"] = ag
-    # Gains only if POSITIVE: a 0 here is a half-filled request, not a request
-    # for a black frame. (Same reason fps/exposure/gain above use `if x:`.)
+    # Gains only if positive: a 0 is a half-filled request, not a black frame (same for `if x:` above).
     red, blue = _num(d.get("red_gain")), _num(d.get("blue_gain"))
     if red or blue:
         r = red if red else state["red_gain"]
@@ -131,12 +134,7 @@ def apply_controls(d):
         if val is not None:
             c[ctrl] = val
             state[key] = val
-    # Exposure and frame duration must stay coherent: a frame cannot be shorter
-    # than its own exposure. Pinning FrameDurationLimits below ExposureTime asks
-    # the sensor for something impossible, and a sensor may stall on that rather
-    # than clamp -- one frame, then nothing. camera_node's fps budget keeps them
-    # consistent, but a client POSTing here goes straight past that, so enforce
-    # it at the only place that owns the camera. Exposure wins; fps gives way.
+    # A frame cannot be shorter than its exposure (a sensor may stall on it): exposure wins, fps gives way.
     if "ExposureTime" in c or "FrameDurationLimits" in c:
         dur = int(1_000_000 / state["framerate"])
         if state["exposure"] > dur:
@@ -152,8 +150,7 @@ def apply_controls(d):
 
 
 def do_white_balance():
-    """One-shot AWB: enable auto, let it settle, read the measured colour gains,
-    then lock them in as manual gains (so they don't drift). Returns the gains."""
+    """One-shot AWB: enable auto, let it settle, then lock the measured gains; returns them."""
     if "AwbEnable" not in picam2.camera_controls:
         return {"error": "this sensor has no auto white balance "
                          "(monochrome — there are no colour gains to measure)"}
@@ -169,15 +166,52 @@ def do_white_balance():
     return {"red_gain": r, "blue_gain": b}
 
 
-def get_controls():
-    """Current settings, merging commanded state with live camera metadata.
+def _configure(cam, name):
+    """Configure `cam` for one of pick_modes()'s modes and start MJPEG recording."""
+    spec = available_modes.get(name) or available_modes["detail"]
+    fps = spec["fps"] or state["framerate"]
+    cam.configure(cam.create_video_configuration(
+        sensor={"output_size": tuple(spec["sensor"])},
+        main={"size": tuple(spec["size"]), "format": "RGB888"},
+        controls={"FrameRate": fps},
+    ))
+    cam.start_recording(MJPEGEncoder(), FileOutput(output))
+    state.update(mode=name, width=spec["size"][0], height=spec["size"][1],
+                 window=spec["window"][0], framerate=fps)
+    print(f"Camera mode {name}: {spec['size'][0]}x{spec['size'][1]} @ {fps:g} fps "
+          f"from sensor {spec['sensor'][0]}x{spec['sensor'][1]}"
+          f"{'' if spec['full_fov'] else '  (CROPPED -- narrower field of view)'}",
+          flush=True)
 
-    `frames` and `frame_age_s` are the diagnosis when video freezes: if frames
-    keeps climbing while a viewer is stuck, the sensor is fine and the problem
-    is downstream (proxy, browser). If it stops climbing, the ENCODER stopped
-    and the cause is here or in the camera.
-    """
+
+def set_mode(name):
+    """Switch sensor mode. Returns the new controls, or {'error': ...}."""
+    if name not in available_modes:
+        return {"error": f"mode must be one of {sorted(available_modes)}"}
+    with _mode_lock:
+        if picam2 is None:
+            return {"error": camera_error or "camera not open"}
+        if name == state["mode"]:
+            return get_controls()
+        previous = state["mode"]
+        picam2.stop_recording()
+        try:
+            _configure(picam2, name)
+        except Exception as exc:
+            # The sensor is stopped here: restore the old mode, never leave it dark.
+            print(f"mode {name} failed ({exc}); restoring {previous}", flush=True)
+            _configure(picam2, previous)
+            apply_controls({})
+            return {"error": f"could not switch to {name}: {exc}; "
+                             f"still in {previous}"}
+        apply_controls({})      # re-assert exposure/gains onto the new config
+    return get_controls()
+
+
+def get_controls():
+    """Commanded settings merged with live metadata; `frames` tells a frozen viewer from a stopped encoder."""
     out = dict(state)
+    out["modes"] = available_modes
     out["frames"] = output.frames
     out["frame_age_s"] = (round(time.monotonic() - output.at, 2)
                           if output.at else None)
@@ -196,10 +230,7 @@ def get_controls():
 
 
 def unavailable():
-    """503 body for every endpoint while the sensor is not open. Keeping this a
-    non-200 is what preserves the gateway's `camera_ok: false` (camera_proxy
-    only checks the status of GET /controls) now that the server itself stays
-    up instead of crash-looping."""
+    """503 body while the sensor is not open; a non-200 keeps the gateway's camera_ok false."""
     return {"error": camera_error, "cameras": camera_list,
             "diagnosis": diagnose(camera_list)}
 
@@ -236,10 +267,7 @@ class Handler(server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _guard(self, fn):
-        """Answer with a 500 instead of dying. A handler that raises leaves the
-        socket hung up, so the client sees "connection reset" and never learns
-        which control the camera rejected -- and the stack trace lands in the
-        container log instead of in the reply."""
+        """Answer 500 with the error instead of dropping the connection."""
         try:
             fn()
         except Exception as exc:
@@ -248,10 +276,15 @@ class Handler(server.BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+    def _reply(self, obj, error_code):
+        """200 with obj, or error_code when the handler refused ({'error': ...})."""
+        self._json(obj, error_code if isinstance(obj, dict) and "error" in obj
+                   else 200)
+
     def do_GET(self):
+        # send_error() already ends the headers; ending them again appends stray bytes.
         if self.path not in ("/", "/stream.mjpg", "/controls", "/focus"):
             self.send_error(404)
-            self.end_headers()
         elif picam2 is None:
             self._json(unavailable(), 503)
         elif self.path == "/controls":
@@ -262,9 +295,8 @@ class Handler(server.BaseHTTPRequestHandler):
             self._stream()
 
     def do_POST(self):
-        if self.path not in ("/controls", "/white_balance"):
+        if self.path not in ("/controls", "/white_balance", "/mode"):
             self.send_error(404)
-            self.end_headers()
             return
         if picam2 is None:
             self._json(unavailable(), 503)
@@ -277,8 +309,10 @@ class Handler(server.BaseHTTPRequestHandler):
             d = {}
         if self.path == "/controls":
             self._guard(lambda: self._json(apply_controls(d)))
+        elif self.path == "/mode":
+            self._guard(lambda: self._reply(set_mode(str(d.get("mode", ""))), 400))
         else:
-            self._guard(lambda: self._json(do_white_balance()))
+            self._guard(lambda: self._reply(do_white_balance(), 409))
 
     def _stream(self):
         self.send_response(200)
@@ -291,10 +325,7 @@ class Handler(server.BaseHTTPRequestHandler):
         try:
             while True:
                 with output.condition:
-                    # Bounded wait: if the encoder stops delivering (sensor
-                    # yanked mid-stream), end the response instead of holding
-                    # the client open forever with no way to tell it apart from
-                    # a slow camera.
+                    # Bounded wait: end the response if the encoder stops, rather than hang the client.
                     if not output.condition.wait(timeout=10.0):
                         return
                     frame = output.frame
@@ -314,9 +345,7 @@ class StreamingServer(socketserver.ThreadingMixIn, server.HTTPServer):
 
 
 def enumerate_cameras():
-    """What libcamera can see right now. [] means the sensor is not visible to
-    this process -- the cable/CSI port, the host's config.txt, or (in the
-    container) a libcamera that does not match the host kernel's camera stack."""
+    """What libcamera can see now; [] means the sensor is not visible to this process."""
     try:
         return Picamera2.global_camera_info()
     except Exception as exc:                       # libcamera itself failed to load
@@ -324,13 +353,7 @@ def enumerate_cameras():
 
 
 def diagnose(camera_list):
-    """The one line that says which problem you actually have.
-
-    Note what the host check is NOT: `rpicam-hello` fails with "Pipeline
-    handler in use by another process" whenever THIS server holds the camera,
-    which is whenever things are working. Stop this service before running it,
-    or you are just watching your own stack own the sensor.
-    """
+    """One line naming the problem: libcamera broken, no sensor, or sensor held elsewhere."""
     if camera_list and isinstance(camera_list[0], dict) and "error" in camera_list[0]:
         return ("libcamera itself failed to load -- the container's libcamera "
                 "does not match the host kernel's camera stack; use the systemd "
@@ -347,63 +370,28 @@ def diagnose(camera_list):
 
 
 def open_camera_forever():
-    """Open the sensor and start MJPEG recording, retrying until it works.
-
-    The sensor is NOT a precondition for serving. Raising out of here used to
-    kill the process, which under `restart: unless-stopped` crash-loops the
-    container: the HTTP surface never comes up, so /controls cannot say what
-    went wrong and the gateway reports a bare `camera_ok: false`. Retrying in
-    the background instead matches how every ROS node in this backend degrades,
-    and a camera that appears late (replug, or the systemd unit releasing it)
-    heals with no restart.
-    """
-    global picam2, camera_error, camera_list
+    """Open the sensor and start recording, retrying in the background until it works."""
+    global picam2, camera_error, camera_list, available_modes
     delay = 2.0
     while True:
         cam = None
         try:
             cam = Picamera2()
-            # Full field of view = the mode covering the most sensor area, which
-            # is then scaled down to SIZE. Chosen by area, NOT by a fixed index:
-            # sensors expose different numbers of modes (IMX219/IMX477 have 3-4),
-            # so sensor_modes[k] is an IndexError on the next camera module -- and
-            # one swallowed by the retry below, where it looks like absent hardware.
-            #
-            # NOTE: this changes the microscope's FOV, so um_per_px from a run
-            # before it is WRONG. Re-run the calibration after changing SIZE or
-            # this selection; nothing downstream can detect a stale value.
-            mode = max(cam.sensor_modes, key=lambda m: m["size"][0] * m["size"][1])
-            # The mode's own ceiling, never above it. A full-resolution mode does
-            # not do 30 fps (IMX708 4608x2592 tops out near 14); libcamera clamps
-            # silently, and then state["framerate"] -- which apply_controls uses
-            # for its exposure-vs-frame-duration budget -- describes a rate the
-            # sensor never delivers.
-            fps = min(state["framerate"], float(mode.get("fps") or state["framerate"]))
-            cam.configure(cam.create_video_configuration(
-                sensor={"output_size": mode["size"], "bit_depth": mode["bit_depth"]},
-                main={"size": SIZE, "format": "RGB888"},
-                controls={"FrameRate": fps},
-            ))
-            cam.start_recording(MJPEGEncoder(), FileOutput(output))
+            available_modes = pick_modes(cam.sensor_modes, DETAIL_MAX_W)
+            if not available_modes:
+                raise RuntimeError("sensor advertises no usable modes")
+            _configure(cam, state["mode"])
             picam2 = cam
-            state["framerate"] = fps
             camera_error, camera_list = None, []
-            # Print what this sensor actually offers: it is the fastest answer to
-            # "why did that control not take" and it says mono vs colour outright.
-            print(f"Camera open {SIZE[0]}x{SIZE[1]} from sensor mode "
-                  f"{mode['size'][0]}x{mode['size'][1]} @ {fps:g} fps "
-                  f"(re-run the calibration if this FOV changed); "
-                  f"controls advertised: {sorted(cam.camera_controls)}", flush=True)
+            print(f"Modes offered: {available_modes}", flush=True)
+            # What this sensor offers: answers "why did that control not take", and mono vs colour.
+            print(f"Controls advertised: {sorted(cam.camera_controls)}", flush=True)
             if "AwbEnable" not in cam.camera_controls:
                 print("  NOTE: no AwbEnable/ColourGains -- monochrome sensor. "
                       "Colour gains and /white_balance do nothing on this camera.",
                       flush=True)
             return
         except Exception as exc:
-            # Close whatever opened. Everything after Picamera2() can throw, and a
-            # leaked instance still OWNS the sensor: the next attempt then fails
-            # with "already in use" for good, turning one transient fault
-            # permanent and blaming a stray process in the diagnosis below.
             if cam is not None:
                 try:
                     cam.close()
@@ -421,8 +409,7 @@ def open_camera_forever():
 
 
 def main():
-    # Serve FIRST, open the sensor second: a camera fault must be reportable
-    # over HTTP, not a reason nothing answers at all.
+    # Serve first, open the sensor second: a camera fault must be reportable over HTTP.
     threading.Thread(target=open_camera_forever, daemon=True,
                      name="camera-open").start()
     print(f"SCOPIO Pi camera server on http://{HOST}:{PORT} "

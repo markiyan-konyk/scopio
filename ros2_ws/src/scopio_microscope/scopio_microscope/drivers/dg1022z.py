@@ -1,18 +1,7 @@
-"""Rigol DG1022Z arbitrary-waveform generator. CH1 = X mirror, CH2 = Y mirror.
+"""Rigol DG1022Z arbitrary-waveform generator; CH1 = X mirror, CH2 = Y mirror (see README.md)."""
 
-Does not open on construction -- galvo_node calls _open(). Every public method
-is reachable over the awg/call service; private (underscore) ones are not.
-
-ALL instrument I/O goes through command()/query(), which hold _lock. galvo_node
-serves awg/* on a reentrant callback group, so two clients can be inside this
-driver at the same time, and two threads interleaved on one USB-TMC session
-produce garbled replies and timeouts, not an error you can trace.
-
-The first block of methods drives the galvo mirrors and keeps its own
-xpos/ypos/offset bookkeeping. Everything after it is the plain instrument, one
-method per thing the front panel can do.
-"""
-
+import glob
+import os
 import threading
 import time
 
@@ -20,8 +9,7 @@ import pyvisa
 
 RIGOL_VID = 0x1AB1
 
-# Every waveform name :SOURce<n>:FUNCtion accepts. Kept here so a UI can fill a
-# picker from shapes() instead of hard-coding the list on the client side.
+# Every waveform name :SOURce<n>:FUNCtion accepts, so a UI can fill a picker from shapes().
 SHAPES = (
     "SIN", "SQU", "RAMP", "PULS", "NOIS", "USER", "HARM", "DC",
     "KAISER", "ROUNDPM", "SINC", "NEGRAMP", "ATTALT", "AMPALT", "STAIRDN",
@@ -51,8 +39,7 @@ SHAPES = (
 )
 
 def usb_vid(resource):
-    """Vendor id from a VISA resource string; pyvisa-py writes it in decimal,
-    NI-VISA in hex. None for non-USB resources."""
+    """Vendor id from a VISA resource string (decimal or hex); None for non-USB resources."""
     parts = resource.split("::")
     if len(parts) < 2 or not parts[0].upper().startswith("USB"):
         return None
@@ -62,16 +49,41 @@ def usb_vid(resource):
         return None
 
 
+SYSFS_USB = "/sys/bus/usb/devices"
+
+
+def usb_present(vid):
+    """sysfs names ('1-1.2') of every USB device with this vendor id, asked of the kernel."""
+    found = []
+    for id_file in glob.glob(os.path.join(SYSFS_USB, "*", "idVendor")):
+        try:
+            with open(id_file, encoding="ascii") as f:
+                if int(f.read().strip(), 16) == vid:
+                    found.append(os.path.basename(os.path.dirname(id_file)))
+        except (OSError, ValueError):
+            continue
+    return sorted(found)
+
+
+def is_rigol(idn):
+    return "RIGOL" in (idn or "").upper()
+
+
 class DG1022Z:
+    # Pacing: at most 50 I/Os per second; the AWG lags seconds behind past ~60/s.
+    MIN_INTERVAL_S = 1.0 / 50
+
     def __init__(self, resource="", timeout_ms=5000):
         self.resource = resource
         self.timeout_ms = timeout_ms
         self._lock = threading.RLock()   # VISA sessions are NOT thread-safe
+        self._last_io = 0.0              # monotonic end of the previous I/O
+        self._desynced = False           # a query failed; clear before the next
+        self.identity = ""               # *IDN? reply, verified on connect
         self.rm = None
         self.device = None
 
-        # Galvo bookkeeping, in volts. pos is the commanded deflection, offset
-        # the per-axis trim that centres the mirror -- a real rig needs it.
+        # Galvo bookkeeping in volts: pos is the commanded deflection, offset the per-axis centre.
         self.xpos = 0.0
         self.ypos = 0.0
         self.xoffset = 0.0
@@ -81,40 +93,75 @@ class DG1022Z:
         self.phase = 0.0
 
     def _open(self):
-        """Open the VISA session. With no resource, take the first RIGOL on USB
-        -- matched by vendor id in the resource string, so another vendor's
-        instrument (the temperature controller) is never opened just to ask
-        what it is."""
+        """Open the session (no resource: the first USB device with Rigol's vendor id), clear it, verify *IDN?."""
         self.rm = pyvisa.ResourceManager("@py")
         if not self.resource:
-            usb = [r for r in self.rm.list_resources("USB?*INSTR")
-                   if usb_vid(r) == RIGOL_VID]
+            listed = list(self.rm.list_resources("USB?*INSTR"))
+            usb = [r for r in listed if usb_vid(r) == RIGOL_VID]
             if not usb:
-                raise RuntimeError("no Rigol AWG on USB; set GALVO_RESOURCE for an "
-                                   "Ethernet unit (pyvisa-py cannot scan the LAN)")
+                raise RuntimeError(self._not_found(listed))
             self.resource = usb[0]
         self.device = self.rm.open_resource(self.resource)
         self.device.read_termination = "\n"
         self.device.write_termination = "\n"
         self.device.timeout = self.timeout_ms
+        # CLEAR before *IDN?: a dead session's queued reply would put us one answer behind.
+        self._resync()
+        idn = self.query("*IDN?")
+        if not is_rigol(idn):
+            raise RuntimeError(f"{self.resource} answered *IDN? with {idn!r} -- "
+                               "that is not a Rigol AWG (GALVO_RESOURCE names "
+                               "another instrument?)")
+        self.identity = idn
+
+    @staticmethod
+    def _not_found(listed):
+        bus = usb_present(RIGOL_VID)
+        if not bus:
+            return ("no Rigol AWG on the USB bus: the kernel reports no 1ab1 "
+                    "device. Check the cable, the power and any hub. An Ethernet "
+                    "unit must be named in GALVO_RESOURCE (no LAN scan).")
+        return (f"a Rigol IS on the USB bus ({', '.join(bus)}) but VISA listed "
+                f"{len(listed)} USB instrument(s), none of them it: libusb could "
+                "not read its descriptors -- device permissions (ros2_ws/udev) or "
+                "another process (a bench script?) holding it.")
+
+    def _resync(self):
+        """Flush the AWG: USB-TMC CLEAR, else read (never query) until empty; then *CLS. Best effort."""
+        with self._lock:
+            self._desynced = False
+            try:
+                self.device.clear()
+            except Exception:
+                old = self.device.timeout
+                try:
+                    self.device.timeout = 200
+                    for _ in range(16):
+                        self.device.read()
+                except Exception:
+                    pass                 # the timeout IS "nothing left"
+                finally:
+                    try:
+                        self.device.timeout = old
+                    except Exception:
+                        pass
+            try:
+                self.command("*CLS")
+            except Exception:
+                pass
 
     def _close(self):
-        """Outputs off, then drop the session. Safe to call twice; a dead link
-        must not stop the session being released."""
+        """Outputs off, then drop the session. Safe to call twice, and on a dead link."""
         with self._lock:
             if self.device is not None:
                 try:
                     self.command(":OUTP1 OFF;:OUTP2 OFF")
                 except Exception:
                     pass
-                self.device.close()
-            if self.rm is not None:
-                self.rm.close()
-            self.device = self.rm = None
+            self._drop()
 
     def _drop(self):
-        """Release the session WITHOUT sending SCPI -- for when the link is
-        already gone and a write would only burn a full timeout."""
+        """Release the session without sending SCPI (a write on a dead link burns a full timeout)."""
         with self._lock:
             for handle in (self.device, self.rm):
                 try:
@@ -127,19 +174,39 @@ class DG1022Z:
     # ------------------------------------------------------------------ #
     #  The only two methods that touch the wire. Everything else uses them.
     # ------------------------------------------------------------------ #
+    def _pace(self):
+        """Wait out MIN_INTERVAL_S since the previous I/O; call with _lock held."""
+        wait = self._last_io + self.MIN_INTERVAL_S - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+
     def command(self, cmd):
         """Write a raw SCPI command."""
         with self._lock:
             if self.device is None:
                 raise ConnectionError("AWG session is closed")
-            self.device.write(cmd)
+            self._pace()
+            try:
+                self.device.write(cmd)
+            finally:
+                self._last_io = time.monotonic()
 
     def query(self, cmd):
         """Write a raw SCPI query and return the reply, stripped."""
         with self._lock:
             if self.device is None:
                 raise ConnectionError("AWG session is closed")
-            return self.device.query(cmd).strip()
+            if self._desynced:
+                self._resync()
+            self._pace()
+            try:
+                return self.device.query(cmd).strip()
+            except Exception:
+                # Its reply may still arrive: flush before the next query, or every answer is one behind.
+                self._desynced = True
+                raise
+            finally:
+                self._last_io = time.monotonic()
 
     # ------------------------------------------------------------------ #
     #  The galvo mirrors
@@ -153,17 +220,15 @@ class DG1022Z:
         self.xpos = self.ypos = 0.0      # what we just wrote IS the zero position
 
     def offsets(self, x=None, y=None):
-        """The per-axis trim that centres each mirror, in volts. Read it with no
-        arguments. Every update()/move()/sininit() position is relative to it."""
-        if x is None and y is None:
-            return {"x": self.xoffset, "y": self.yoffset}
+        """Read (no args) or set the per-axis offset in volts, the zero of the position scale; returns both."""
         if x is not None:
             self.xoffset = float(x)
         if y is not None:
             self.yoffset = float(y)
+        return {"x": self.xoffset, "y": self.yoffset}
 
     def update(self, ch: int, val: float):
-        """Jump a mirror to a position in volts, on top of its calibrated offset."""
+        """Jump one mirror (ch 1 = X, 2 = Y) to `val` volts of deflection from its offset; returns {x, y}."""
         val = float(val)
         if ch == 1:
             self.xpos, out = val, val + self.xoffset
@@ -172,23 +237,26 @@ class DG1022Z:
         else:
             raise ValueError(f"channel must be 1 (X) or 2 (Y), got {ch}")
         self.command(f":SOURce{ch}:VOLTage:OFFSet {out:.3f}")
+        return self.position()
 
     def position(self):
-        """Where the mirrors were last commanded to, in volts."""
+        """Both mirrors' last-commanded deflections {x, y} in volts, by any client (no hardware readback)."""
         return {"x": self.xpos, "y": self.ypos}
 
     def move(self, ch: int, endval: float, t: float = 1.0, steps: int = 60):
-        """Ramp a mirror to a position over t seconds instead of jumping there."""
+        """Ramp one mirror to `endval` volts over t seconds (steps capped by the pacing); returns {x, y}."""
         start = self.xpos if ch == 1 else self.ypos
         steps = max(1, int(steps))
+        if t > 0 and self.MIN_INTERVAL_S > 0:
+            steps = max(1, min(steps, int(float(t) / self.MIN_INTERVAL_S)))
         dwell = max(0.0, float(t)) / steps
         for i in range(1, steps + 1):
             self.update(ch, start + (float(endval) - start) * i / steps)
             time.sleep(dwell)
+        return self.position()
 
     def sininit(self, freq=None, amp=None, phase=None):
-        """Start both mirrors scanning: a sine on each channel about its current
-        position. Omitted arguments keep the value from the last sin* call."""
+        """Start a sine on both mirrors about their positions; omitted args keep the last sin* values."""
         self._remember(freq, amp, phase)
         if self.amp <= 0:
             raise ValueError("sine amplitude is 0 Vpp -- call with amp=<Vpp>")
@@ -198,8 +266,7 @@ class DG1022Z:
                      f"{self.yoffset + self.ypos:.3f},{self.phase}")
 
     def sinupdate(self, ch: int, freq=None, amp=None, phase=None):
-        """Change one scanning mirror's sine frequency, amplitude or phase.
-        Omitted arguments keep the value from the last sin* call."""
+        """Change one mirror's sine frequency, amplitude or phase; omitted args keep the last values."""
         if ch not in (1, 2):
             raise ValueError(f"channel must be 1 (X) or 2 (Y), got {ch}")
         self._remember(freq, amp, phase)
@@ -216,15 +283,7 @@ class DG1022Z:
             self.phase = float(phase)
 
     # ================================================================== #
-    #  The rest of the instrument -- one method per thing the front panel
-    #  can do, so a UI never has to compose SCPI.
-    #
-    #  Convention: a scalar setting is ONE method that both sets and
-    #  reads. Pass the value to set it, leave it out to read it back:
-    #      frequency(1, 1000)  -> sets CH1 to 1 kHz
-    #      frequency(1)        -> returns 1000.0
-    #  Grouped readers (waveform, am_config, snapshot, ...) return a dict
-    #  so a UI panel fills itself in one round trip instead of twenty.
+    #  The rest of the instrument: pass a value to set, omit it to read
     # ================================================================== #
 
     # ------------------------------------------------------------------ #
@@ -483,12 +542,7 @@ class DG1022Z:
     #  Arbitrary waveforms
     # ------------------------------------------------------------------ #
     def upload(self, ch:int=1, points=(), rate:float=None):
-        """Send 8-16384 normalised points (-1..1) to volatile memory and play them.
-
-        This is how a UI ships a waveform it drew. The instrument switches to
-        arbitrary output on its own. A full 16k upload is a long single write -
-        open the driver with a generous timeout_ms if you send them often.
-        """
+        """Send 8-16384 normalised points (-1..1) to volatile memory and play them (a 16k upload is slow)."""
         if not 8 <= len(points) <= 16384:
             raise ValueError(f"need between 8 and 16384 points, got {len(points)}")
         data = ",".join(f"{float(p):.5f}" for p in points)
@@ -817,11 +871,7 @@ class DG1022Z:
 
     def burst_setup(self, ch:int=1, cycles:int=None, period:float=None, mode:str=None,
                     phase:float=None, delay:float=None, idle:str=None, on:bool=None):
-        """Configure a burst: cycles per burst, burst period s, TRIG/INF/GAT mode.
-
-        Set the burst parameters BEFORE switching it on, so the output does not
-        run through a string of intermediate configurations.
-        """
+        """Configure a burst: cycles per burst, burst period s, TRIG/INF/GAT mode (set up before on=True)."""
         if mode is not None:
             self.command(f":SOURce{ch}:BURSt:MODE {mode}")
         if cycles is not None:
@@ -1000,11 +1050,7 @@ class DG1022Z:
 
     def couple_frequency(self, on:bool=None, mode:str=None, deviation:float=None,
                          ratio:float=None):
-        """Frequency coupling: OFFSet or RATio mode, plus the deviation Hz or ratio.
-
-        Set mode and deviation/ratio BEFORE switching it on - the instrument
-        refuses those commands while the coupling is already enabled.
-        """
+        """Frequency coupling: OFFSet or RATio mode, deviation Hz or ratio (refused once coupling is on)."""
         if on is None and mode is None and deviation is None and ratio is None:
             return {"on": self.query(":COUPling:FREQuency:STATe?").strip().upper() == "ON",
                     "mode": self.query(":COUPling:FREQuency:MODE?").strip(),
@@ -1156,11 +1202,7 @@ class DG1022Z:
     #  One call that fills a whole UI
     # ------------------------------------------------------------------ #
     def snapshot(self, ch:int=None):
-        """Everything a UI panel needs. Omit `ch` for both channels at once.
-
-        One dispatch round trip instead of twenty, which matters because every
-        call crosses the API gateway and the ROS service before it reaches USB.
-        """
+        """Everything a UI panel needs in one round trip; omit `ch` for both channels."""
         if ch is None:
             return {"idn": self.idn(),
                     "channels": [self.snapshot(1), self.snapshot(2)]}

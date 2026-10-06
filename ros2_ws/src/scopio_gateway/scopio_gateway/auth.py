@@ -1,23 +1,4 @@
-"""API-key authentication for the gateway.
-
-Keys live in a JSON file on the Pi (NOT in git):
-
-    ros2_ws/secrets/api_keys.json      {"ui": "<48 hex chars>", "agent": "..."}
-
-Generate/rotate keys with:  python3 ros2_ws/scripts/generate_api_key.py <name>
-
-Clients authenticate every request with either:
-  * header       X-API-Key: <key>          (preferred)
-  * query param  ?api_key=<key>            (for browser <img>/WebSocket, which
-                                            cannot set headers)
-
-Notes:
-  * Comparison is constant-time (hmac.compare_digest) against every stored key.
-  * The file is hot-reloaded when its mtime changes -- add/revoke keys without
-    restarting the gateway.
-  * If the file is missing or empty, ALL authenticated routes are denied (fail
-    closed) and /api/v1/health reports auth_configured=false so it's obvious.
-"""
+"""API-key auth: hot-reloaded key file, constant-time compare, fail closed (see README.md)."""
 
 import hmac
 import json
@@ -63,8 +44,7 @@ class KeyStore:
         """Return the key's name if presented matches a stored key, else None."""
         if not presented:
             return None
-        # compare_digest raises TypeError on non-ASCII str; keys are hex, so
-        # anything unencodable is simply wrong -- a 401, not a 500.
+        # compare_digest raises on non-ASCII str; keys are hex, so such a key is just wrong (401, not 500).
         try:
             presented.encode("ascii")
         except UnicodeEncodeError:
@@ -73,8 +53,7 @@ class KeyStore:
             self._load()
             match = None
             for name, key in self._keys.items():
-                # Compare against every key (constant-time each) -- no early exit
-                # pattern that could leak which key prefix matched.
+                # Every key, constant-time, no early exit.
                 if hmac.compare_digest(presented, key):
                     match = name
             return match

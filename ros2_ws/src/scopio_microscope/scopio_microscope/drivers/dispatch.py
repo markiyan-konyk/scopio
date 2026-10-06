@@ -1,28 +1,10 @@
-"""Turn a driver class into a ROS service surface: call a method by name.
-
-Used by galvo_node (DG1022Z) and temperature_node (TC10LAB), and by any future
-instrument node the same way. The node owns the instrument object; a client
-sends `{method, args, kwargs}` as JSON strings (InstrumentCall.srv) and gets the
-JSON-encoded return value back. That is the whole API -- every method the driver
-class has ever had, or will have, is reachable the day it is written, with no new
-.srv files, no gateway change and no client update.
-
-Why JSON strings and not typed fields: ROS request fields are statically typed,
-so a typed API would need one service per method signature -- exactly the
-combinatorial explosion this design avoids (see docs/DECISIONS.md).
-
-Safety rails, deliberately thin: private methods (leading underscore) and
-BLOCKED are unreachable; everything else is fair game -- the client is trusted,
-it already has an API key, and raw SCPI is exposed anyway.
-"""
+"""Turn a driver class into a ROS service surface: call a public method by name with JSON args."""
 
 import inspect
 import json
 import math
 
-# A public method that would tear down the session the NODE owns, rather than do
-# instrument work. The drivers name theirs _close/_drop (already private), so
-# this is standing insurance for the next driver, not a live rule.
+# Would tear down the session the node owns; insurance for future drivers (today's use _close/_drop).
 BLOCKED = frozenset({"close"})
 
 
@@ -31,11 +13,7 @@ class DispatchError(Exception):
 
 
 def parse_args(args_json, kwargs_json):
-    """'[25.0]' / '{"channel": 2}' -> ([25.0], {"channel": 2}). Empty -> ()/{}.
-
-    A bare scalar is accepted as a single positional arg ("25.0" == "[25.0]"),
-    because that is what people type by hand at a curl prompt.
-    """
+    """'[25.0]' / '{"channel": 2}' -> ([25.0], {"channel": 2}); a bare scalar is one arg."""
     args = _loads(args_json, "args", default=[])
     kwargs = _loads(kwargs_json, "kwargs", default={})
     if not isinstance(args, list):
@@ -89,11 +67,7 @@ def resolve(driver, method):
 
 
 def call(driver, method, args_json="", kwargs_json=""):
-    """Dispatch one call. Returns the JSON-encoded result.
-
-    Raises DispatchError for bad requests; anything the instrument itself
-    raises propagates to the caller (the node reports it as `error`).
-    """
+    """Dispatch one call and return the JSON result; bad requests raise DispatchError."""
     fn = resolve(driver, method)
     args, kwargs = parse_args(args_json, kwargs_json)
     try:
@@ -104,14 +78,9 @@ def call(driver, method, args_json="", kwargs_json=""):
 
 
 def describe(driver_cls, extra=()):
-    """[{name, signature, doc}] for every callable a client may use.
-
-    Introspects the CLASS, so `list_methods` still answers while the hardware is
-    disconnected. `extra` documents the node's own meta-methods.
-    """
+    """[{name, signature, doc}] for every public method of the class, plus `extra` meta-methods."""
     out = []
-    # getmembers, not vars(): it walks the MRO, so a driver that subclasses
-    # another (or gains a mixin) still lists everything a client can call.
+    # getmembers, not vars(): it walks the MRO, so inherited methods are listed too.
     for name, member in inspect.getmembers(driver_cls, inspect.isroutine):
         if name.startswith("_") or name in BLOCKED:
             continue

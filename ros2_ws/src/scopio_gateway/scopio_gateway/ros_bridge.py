@@ -1,22 +1,4 @@
-"""The gateway's foot in the ROS 2 graph.
-
-One rclpy node ("gateway") spins on a MultiThreadedExecutor in a background
-thread; FastAPI/uvicorn owns the main thread's asyncio loop. Everything that
-crosses the boundary goes through loop.call_soon_threadsafe -- request
-handlers NEVER spin rclpy and rclpy callbacks NEVER touch asyncio directly.
-
-Responsibilities:
-  * name resolution   -- "stage/jog" -> "/scopio/stage/jog" (absolute paths
-                         starting with "/" pass through untouched)
-  * type discovery    -- cached from the live graph, refreshed on miss, so a
-                         future node (e.g. temperature) is reachable through
-                         the generic endpoints with ZERO gateway changes
-  * service calls     -- async, per-(name,type) client cache
-  * subscriptions     -- QoS mirrored from the publisher (so latched topics
-                         like `calibration` deliver their retained value)
-  * telemetry cache   -- always-on subscriptions to the small SCOPIO state
-                         topics, feeding GET /api/v1/status
-"""
+"""The gateway's node in the ROS graph; rclpy never touches asyncio except via call_soon_threadsafe (see README.md)."""
 
 import threading
 import time
@@ -33,11 +15,11 @@ from rclpy.qos import (
 )
 from rosidl_runtime_py.utilities import get_message, get_service
 
-from .conversion import build_msg, msg_to_jsonable, normalize_msg_type
+from .conversion import BULKY_TYPES, build_msg, msg_to_jsonable, normalize_msg_type
 
 NAMESPACE = "/scopio"
 
-# Small state topics cached for GET /api/v1/status (relative to /scopio).
+# Always in GET /api/v1/status, null until published: clients key on these names.
 TELEMETRY_TOPICS = [
     "stage/position",
     "camera/state",
@@ -47,11 +29,9 @@ TELEMETRY_TOPICS = [
     "calibration",
 ]
 
-# Published TRANSIENT_LOCAL by their nodes, so a late joiner -- like this
-# gateway -- still gets the last value instead of waiting for the next one.
-# Subscribing to these with the default durability receives NOTHING from a
-# topic that only ever publishes on change (the relay).
-LATCHED_TOPICS = {"calibration", "relay/state"}
+# The convention for new nodes: any <name>/status or <name>/state topic joins /status by itself.
+TELEMETRY_SUFFIXES = ("status", "state")
+DISCOVERY_PERIOD_S = 5.0
 
 
 def resolve(path):
@@ -78,6 +58,8 @@ class RosBridge:
         self._action_types = {}
         self._clients = {}
         self._telemetry = {}  # full topic name -> {"msg": jsonable, "stamp": float}
+        self._telemetry_subs = {}  # full topic name -> rclpy subscription
+        self._telemetry_lock = threading.Lock()
         self._started = time.time()
 
     # ---------------------------------------------------------- lifecycle
@@ -89,7 +71,8 @@ class RosBridge:
         self.thread = threading.Thread(target=self.executor.spin, daemon=True,
                                        name="rclpy-executor")
         self.thread.start()
-        self._subscribe_telemetry()
+        self._discover_telemetry()
+        self.node.create_timer(DISCOVERY_PERIOD_S, self._discover_telemetry)
 
     def shutdown(self):
         try:
@@ -110,8 +93,7 @@ class RosBridge:
     # ------------------------------------------------------ type discovery
     def refresh_types(self):
         if self.node is None:
-            # The gateway serves even when rclpy failed to start (see main.py),
-            # so every graph lookup funnels through here for one clear reason.
+            # The gateway serves without rclpy (see main.py); every graph lookup fails here, clearly.
             raise RuntimeError("gateway is not attached to a ROS graph "
                                "(see /api/v1/health: ros_ok)")
         with self._lock:
@@ -189,11 +171,7 @@ class RosBridge:
         return client
 
     async def call_service(self, path, body, timeout=10.0):
-        """Generic JSON service call. Returns the response as a jsonable dict.
-
-        Raises UnknownInterface (404), ValueError (bad fields, 422),
-        asyncio.TimeoutError (504).
-        """
+        """Call a service with a JSON body; raises UnknownInterface, ValueError or asyncio.TimeoutError."""
         full_name = resolve(path)
         type_str = self.service_type(full_name)
         srv_cls = get_service(type_str)
@@ -210,8 +188,7 @@ class RosBridge:
 
     # ------------------------------------------------------- subscriptions
     def qos_for_topic(self, full_name, depth=10):
-        """Mirror the live publisher's QoS so latched topics latch and
-        best-effort topics don't force reliability."""
+        """Mirror the live publisher's QoS, so latched topics latch and best-effort ones stay best-effort."""
         infos = self.node.get_publishers_info_by_topic(full_name)
         durability = DurabilityPolicy.VOLATILE
         reliability = ReliabilityPolicy.RELIABLE
@@ -230,8 +207,7 @@ class RosBridge:
         )
 
     def create_subscription(self, full_name, callback):
-        """Subscribe to any topic; callback(jsonable_msg) runs in the executor
-        thread. Returns the rclpy subscription (destroy it when done)."""
+        """Subscribe to any topic; callback(jsonable_msg) runs on the executor thread."""
         type_str = self.topic_type(full_name)
         msg_cls = get_message(normalize_msg_type(type_str))
 
@@ -246,40 +222,55 @@ class RosBridge:
         return self.node.create_publisher(msg_cls, full_name, 10), msg_cls
 
     # ---------------------------------------------------------- telemetry
-    def _subscribe_telemetry(self):
-        from scopio_interfaces.msg import (  # noqa: F401 (types resolved here)
-            AwgStatus, Calibration, CameraState, StagePosition, TemperatureStatus,
-        )
-        from std_msgs.msg import Bool
-        type_map = {
-            "stage/position": StagePosition,
-            "camera/state": CameraState,
-            "awg/status": AwgStatus,
-            "temperature/status": TemperatureStatus,
-            "relay/state": Bool,
-            "calibration": Calibration,
-        }
-        for rel in TELEMETRY_TOPICS:
-            full = resolve(rel)
-            qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1)
-            if rel in LATCHED_TOPICS:
-                qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+    @staticmethod
+    def is_telemetry(full_name):
+        """Whether a topic belongs in /status: the fixed list, or a */status or */state name."""
+        prefix = NAMESPACE + "/"
+        if not full_name.startswith(prefix):
+            return False
+        rel = full_name[len(prefix):]
+        return rel in TELEMETRY_TOPICS or rel.rsplit("/", 1)[-1] in TELEMETRY_SUFFIXES
 
-            def _make_cb(topic_full):
-                def _cb(msg):
-                    self._telemetry[topic_full] = {
-                        "msg": msg_to_jsonable(msg),
-                        "stamp": time.time(),
-                    }
-                return _cb
+    def _discover_telemetry(self):
+        """Subscribe to new telemetry topics once they have a publisher, whose QoS (latching) is mirrored."""
+        try:
+            topics = self.node.get_topic_names_and_types()
+        except Exception:
+            return
+        for name, types in topics:
+            if not types or not self.is_telemetry(name):
+                continue
+            with self._telemetry_lock:
+                if name in self._telemetry_subs:
+                    continue
+            type_str = normalize_msg_type(types[0])
+            if type_str in BULKY_TYPES:
+                continue
+            try:
+                if not self.node.get_publishers_info_by_topic(name):
+                    continue
+                msg_cls = get_message(type_str)
+                sub = self.node.create_subscription(
+                    msg_cls, name, self._telemetry_cb(name),
+                    self.qos_for_topic(name, depth=1))
+            except Exception:
+                continue           # an unimportable type: skip, retry next scan
+            with self._telemetry_lock:
+                self._telemetry_subs[name] = sub
 
-            self.node.create_subscription(type_map[rel], full, _make_cb(full), qos)
+    def _telemetry_cb(self, full_name):
+        def _cb(msg):
+            self._telemetry[full_name] = {"msg": msg_to_jsonable(msg),
+                                          "stamp": time.time()}
+        return _cb
 
     def telemetry_snapshot(self):
-        out = {}
-        for rel in TELEMETRY_TOPICS:
-            entry = self._telemetry.get(resolve(rel))
-            out[rel] = entry if entry else None
+        """The fixed names (null until published), then every discovered topic, relative to /scopio."""
+        out = {rel: self._telemetry.get(resolve(rel)) for rel in TELEMETRY_TOPICS}
+        prefix = NAMESPACE + "/"
+        for full in sorted(list(self._telemetry)):
+            rel = full[len(prefix):] if full.startswith(prefix) else full
+            out.setdefault(rel, self._telemetry[full])
         return out
 
 

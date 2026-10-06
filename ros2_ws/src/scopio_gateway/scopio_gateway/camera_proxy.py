@@ -1,20 +1,4 @@
-"""Authenticated front door for the loopback-only camera server.
-
-The picamera2 camera server (camera_server/pi_camera_server.py) binds to
-127.0.0.1:8081 -- it has no auth of its own, so it must never face the LAN.
-The gateway proxies it:
-
-    GET  /api/v1/stream.mjpg          -> chunk passthrough of /stream.mjpg
-                                         (no decode, no re-encode -- cheap)
-    GET  /api/v1/camera/controls      -> /controls
-    POST /api/v1/camera/controls      -> /controls
-    POST /api/v1/camera/white_balance -> /white_balance
-    GET  /api/v1/camera/focus         -> /focus
-
-CAMERA_URL env selects the upstream (default http://127.0.0.1:8081). Set it
-empty to declare "no camera" -- endpoints then 503 cleanly and /health says
-camera_ok=false (used by the no-hardware dev compose).
-"""
+"""Authenticated proxy to the loopback-only camera server; CAMERA_URL empty means no camera."""
 
 import os
 import time
@@ -65,9 +49,14 @@ async def forward(method, path, json_body=None):
     except httpx.HTTPError as exc:
         raise HTTPException(503, f"Camera server unreachable: {exc}") from exc
     try:
-        return r.json()
+        body = r.json()
     except ValueError:
         raise HTTPException(502, "Camera server returned non-JSON.")
+    # Pass the server's failure code through: its error body under a 200 reads as success.
+    if r.status_code >= 400:
+        detail = body.get("error", body) if isinstance(body, dict) else body
+        raise HTTPException(r.status_code, detail)
+    return body
 
 
 async def mjpeg_stream():

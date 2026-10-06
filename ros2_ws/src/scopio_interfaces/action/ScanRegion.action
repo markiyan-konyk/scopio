@@ -1,8 +1,4 @@
-# Jump-scan a rectangular region of the sample by stepping the stage across a
-# grid of frames (no smooth motion needed -- it jumps frame to frame, knowing
-# its global position). The backend only DRIVES the pattern and reports where it
-# is; deciding what each frame contains is the client's job, from the video
-# stream (the Pi does no image analysis).
+# Step the stage across a grid of stops over a rectangle; what each frame shows is the client's job.
 int32 x_min           # stage steps
 int32 x_max
 int32 y_min

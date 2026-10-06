@@ -26,7 +26,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/AwgWrite.srv"
   "srv/AwgQuery.srv"
   "srv/CalibrationSet.srv"
-  "srv/InstrumentCall.srv"   # generic driver-method dispatch (galvo)
+  "srv/InstrumentCall.srv"   # generic driver-method dispatch (galvo, temperature)
   # ---- Actions ----
   "action/MoveStagePath.action"
   "action/ScanRegion.action"

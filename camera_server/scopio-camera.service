@@ -1,8 +1,4 @@
-# SCOPIO camera server -- systemd FALLBACK for when picamera2/libcamera won't
-# run inside the camera container on your Pi. Install with ./install_systemd.sh
-# (and disable/comment out the `camera` service in ros2_ws/docker-compose.yml).
-#
-# Uses the OS-preinstalled python3-picamera2 on Raspberry Pi OS Bookworm.
+# Camera server as a systemd unit, the fallback to the camera container; install with install_systemd.sh (see README.md).
 [Unit]
 Description=SCOPIO Pi camera server (MJPEG + controls on loopback :8081)
 After=network.target

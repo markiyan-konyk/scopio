@@ -1,13 +1,5 @@
 #!/bin/bash
-# SCOPIO graph health check. Run with ROS 2 + the workspace sourced, from inside
-# the container (`docker compose exec scopio bash`) or any machine on the LAN
-# that has ROS 2 sourced and is on the same DDS domain.
-#
-#   bash scripts/smoke_test.sh
-#
-# It does NOT need hardware: nodes come up even with no camera/stage/galvo, so
-# this verifies the graph itself first, then tells you which topics are actually
-# producing data.
+# ROS graph health check, no hardware needed: docker compose exec scopio /entrypoint.sh bash /ros2_ws/scripts/smoke_test.sh
 set -u
 NS=/scopio
 
@@ -15,7 +7,7 @@ echo "================ nodes ================"
 ros2 node list
 echo
 echo "expected:"
-for n in calibration_node camera_node stage_node galvo_node temperature_node; do
+for n in calibration_node camera_node stage_node galvo_node temperature_node relay_node; do
   if ros2 node list 2>/dev/null | grep -q "$NS/$n"; then
     echo "  ok       $n"
   else

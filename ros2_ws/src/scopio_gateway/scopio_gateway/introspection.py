@@ -1,10 +1,4 @@
-"""GET /api/v1/interfaces -- self-describing discovery of the live graph.
-
-Lists every service, topic and action currently visible (standard ROS plumbing
-filtered out) with per-field schemas, so a developer -- or an agent -- can ask
-the microscope what it can do instead of reading the docs. New nodes (e.g. the
-planned temperature sensor/heater) show up here automatically.
-"""
+"""GET /api/v1/interfaces: every service, topic and action in the live graph, with field schemas."""
 
 from rosidl_runtime_py.utilities import get_action, get_message, get_service
 
@@ -23,8 +17,7 @@ def interfaces_payload(bridge):
 
     out = {"namespace": "/scopio", "services": {}, "topics": {}, "actions": {}}
 
-    # Actions appear in the service/topic tables as _action/* internals; the
-    # action table already names them properly, so drop the internals.
+    # Actions also appear as _action/* services and topics; the action table names them properly.
     def _is_action_internal(name):
         return "/_action/" in name
 

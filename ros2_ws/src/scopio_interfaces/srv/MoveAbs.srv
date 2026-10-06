@@ -1,5 +1,4 @@
-# Move the stage to an absolute target in Sangaboard steps (single move; for a
-# multi-point route use the stage/move_path action instead).
+# Move the stage to one absolute target in steps (for a route, use the stage/move_path action).
 int32 x
 int32 y
 int32 z

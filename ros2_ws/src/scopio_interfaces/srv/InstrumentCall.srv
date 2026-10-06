@@ -1,21 +1,4 @@
-# Call ANY public method on an instrument driver class living inside a node.
-#
-# This is the generic "the node owns the whole driver, the client picks what to
-# use" surface (galvo_node -> DG1022Z). One service covers every present and
-# future capability of the instrument, so the ROS contract never grows a
-# method-per-service combinatorial API and the node stays instrument-agnostic.
-#
-#   method: "update"         args: "[1, 0.20]"                 kwargs: ""
-#   method: "dcinit"         args: ""                          kwargs: ""
-#   method: "sinupdate"      args: "[1]"                       kwargs: "{\"freq\": 50}"
-#   method: "list_methods"   args: ""                          kwargs: ""
-#
-# Method names are NOT part of this contract -- they are whatever the driver
-# class has today. Call "list_methods" rather than trusting these examples.
-#
-# Discoverability: call "list_methods" -- it returns the name, signature and
-# docstring of every callable the node exposes, so a client (or an agent) can
-# ask the instrument what it can do instead of reading the driver source.
+# Call any public method of the node's driver class; method names are not part of this contract (call list_methods).
 string method    # method name on the driver, or a node meta-method
 string args      # JSON array of positional args   ("" == none)
 string kwargs    # JSON object of keyword args     ("" == none)

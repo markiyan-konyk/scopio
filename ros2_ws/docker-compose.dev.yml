@@ -1,19 +1,4 @@
-# No-hardware DEV override -- run the backend + gateway on a laptop (works
-# under Docker Desktop on Windows/macOS, where network_mode: host does not
-# behave). The driver nodes degrade gracefully, so the graph comes up with
-# everything reporting connected=false and the API is fully testable.
-#
-#   cd ros2_ws
-#   python3 scripts/generate_api_key.py dev          # once
-#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
-#   python3 scripts/smoke_test_api.py --url http://localhost:8000
-#
-# Differences from production:
-#  * bridge networking; the scopio container owns the network namespace and
-#    publishes port 8000, the gateway joins that namespace -- so gateway<->graph
-#    DDS traffic stays on localhost exactly like on the Pi
-#  * no camera service (its image is arm/Pi-only); CAMERA_URL empty ->
-#    /health reports camera_ok: false and the stream endpoint 503s cleanly
+# No-hardware override for a laptop (see README.md): docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 services:
   scopio:
     network_mode: bridge

@@ -1,31 +1,4 @@
-# SCOPIO BACKEND -- everything that runs ON the Raspberry Pi, one command:
-#
-#   cd ros2_ws
-#   docker compose up -d --build
-#
-# Three services:
-#   scopio   -- the ROS 2 sensor/effectuator graph (camera, stage, galvo,
-#               calibration) under /scopio. Headless, "sacred".
-#   camera   -- picamera2 MJPEG server (camera_server/), loopback-only :8081.
-#               Debian bookworm + Raspberry Pi apt archive, because
-#               picamera2/libcamera cannot run in the Ubuntu ROS container.
-#               If libcamera misbehaves in-container on your Pi, use the
-#               systemd fallback instead: camera_server/install_systemd.sh.
-#   gateway  -- the PUBLIC API (HTTP/WebSocket, port 8000, API-key auth).
-#               External apps (ui, galvo_draw, agents) talk ONLY to this --
-#               no ROS, no Docker, no DDS on the client side.
-#
-# All services use restart: unless-stopped, so a rebooted Pi comes back up
-# with zero SSH sessions (enable docker itself: sudo systemctl enable docker).
-#
-# Notes:
-#  * network_mode: host -> DDS stays on localhost between scopio and gateway;
-#    the only LAN-facing port is the gateway's 8000 (and 8081 stays loopback).
-#  * privileged + /run/udev -> USB galvo, serial stage, camera devices.
-#    For least-privilege, replace `privileged` with the commented devices list.
-#  * API keys: python3 scripts/generate_api_key.py <name>  (see docs/API.md).
-#  * Which instrument is which: .env in THIS folder (cp .env.example .env).
-#    Compose reads it automatically -- nothing to export, nothing to remember.
+# SCOPIO on the Pi: `docker compose up -d --build` here. Explained in README.md and ../docs/CONFIGURATION.md.
 services:
   scopio:
     build:
@@ -38,47 +11,21 @@ services:
     ipc: host
     restart: unless-stopped
     volumes:
-      - ..:/workspace                # repo root: working dir, calibration.json
+      - ./data:/data                 # runtime state only; the repo is never mounted
       - /run/udev:/run/udev:ro
-      - /dev:/dev                    # hotplug -- see the note below `command:`
+      - /dev:/dev                    # hotplug: privileged alone snapshots /dev at create time
     environment:
-      # Instrument addresses come from .env in this folder (see .env.example).
-      # Empty => the node auto-discovers the first USB instrument, which is only
-      # safe with ONE instrument on the bus. An Ethernet TC LAB must always be
-      # named there: pyvisa-py cannot scan the LAN.
+      # From .env; empty = auto-discover by vendor id. An Ethernet TC10 must be named.
       - GALVO_RESOURCE=${GALVO_RESOURCE:-}
       - TCLAB_RESOURCE=${TCLAB_RESOURCE:-}
       - SANGABOARD_PORT=${SANGABOARD_PORT:-}
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
       - CAMERA_URL=http://127.0.0.1:8081   # camera_node bridge mode upstream
-      # relay_node's GPIO backend, named rather than guessed. gpiozero probes
-      # lgpio -> rpigpio -> pigpio -> native and takes the first that imports;
-      # `native` imports anywhere and then does not drive a modern Pi's pins, so
-      # an unset factory can pick a backend that fails silently. python3-lgpio
-      # is installed in the image (see Dockerfile) -- say so.
+      # Named: an unset factory can fall through to `native`, which does not drive a modern Pi's pins.
       - GPIOZERO_PIN_FACTORY=${GPIOZERO_PIN_FACTORY:-lgpio}
-    working_dir: /workspace
+    working_dir: /data
     command: ros2 launch scopio_microscope microscope.launch.py
-    # HOTPLUG, and why /dev is bind-mounted even though privileged is set:
-    #
-    # `privileged: true` does NOT share the host's /dev. It lifts the device
-    # cgroup restrictions and populates the container's /dev with a node for
-    # every host device THAT EXISTED WHEN THE CONTAINER WAS CREATED. So an
-    # instrument plugged in (or replugged -- a new /dev/bus/usb/BBB/DDD, or a
-    # /dev/usbtmc0 that udev makes when the kernel driver binds) afterwards is
-    # invisible inside, and the node reports "not present" for a box you can see
-    # on the host with lsusb. Verify on your Pi in one line:
-    #
-    #   ls -l /dev/usbtmc* /dev/bus/usb/*/* | wc -l
-    #   docker compose exec scopio ls -l /dev/usbtmc* /dev/bus/usb/*/* | wc -l
-    #
-    # The `- /dev:/dev` volume below is a recursive bind of the host devtmpfs, so
-    # new nodes DO appear and the reconnect timers pick the instrument up with no
-    # restart. Cost: the container shares the host's /dev/pts and /dev/shm. If
-    # `docker compose exec -it` ever misbehaves because of that, drop the mount
-    # and instead recreate the stack after plugging instruments in.
-    #
-    # Least-privilege alternative (no privileged): name each device explicitly.
+    # Least-privilege alternative to privileged (untested; a listed device that does not exist yet stops the start):
     # devices:
     #   - /dev/dma_heap:/dev/dma_heap
     #   - /dev/vchiq:/dev/vchiq
@@ -86,9 +33,8 @@ services:
     #   - /dev/ttyACM0:/dev/ttyACM0   # Sangaboard
     #   - /dev/bus/usb:/dev/bus/usb   # DG1022Z (libusb / pyvisa-py)
     #   - /dev/usbtmc0:/dev/usbtmc0   # TC10 LAB (kernel usbtmc char device)
-    # device_cgroup_rules:            # `devices:` also binds at start, and a
-    #   - "c 180:* rmw"               # named path that does not exist yet stops
-    #                                 # the container from starting at all.
+    # device_cgroup_rules:
+    #   - "c 180:* rmw"
 
   camera:
     build:
@@ -102,8 +48,6 @@ services:
     volumes:
       - /run/udev:/run/udev:ro
       - /dev:/dev                  # so a camera that appears later is visible
-                                   # (privileged alone snapshots /dev at create
-                                   # time -- see the note in the scopio service)
     environment:
       - CAM_HOST=127.0.0.1         # loopback ONLY -- the gateway is the door
       - CAM_PORT=8081
@@ -111,13 +55,9 @@ services:
       - CAM_H=${CAM_H:-480}
 
   gateway:
-    # Same image as scopio. The build block is repeated (not just `image:`) so
-    # the layer cache makes it free AND `docker compose up gateway` on its own
-    # works instead of trying to pull a tag that only exists locally.
-    build:
-      context: .
-      dockerfile: Dockerfile
+    # Reuses the image scopio builds (a second build: built it twice in parallel); the tag is local only.
     image: scopio-microscope:jazzy
+    pull_policy: never
     container_name: scopio-gateway
     network_mode: host
     ipc: host

@@ -1,7 +1,7 @@
-# Update the persisted spatial calibration. Set a field to NaN to leave it
-# unchanged. The new values are persisted to disk and re-published on the
-# latched `calibration` topic.
+# Update and persist the calibration. NaN (or 0) leaves a field unchanged.
 float64 um_per_px
+int32 um_per_px_width    # send with every um_per_px, or the scale cannot follow a mode change
+int32 um_per_px_window   # send with every um_per_px (see Calibration.msg)
 float64 steps_per_um_x
 float64 steps_per_um_y
 float64 steps_per_um_z

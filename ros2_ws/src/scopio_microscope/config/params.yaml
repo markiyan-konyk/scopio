@@ -1,9 +1,4 @@
-# SCOPIO node parameters. Loaded by microscope.launch.py.
-# Topic/namespace: everything lives under /scopio.
-#
-# The backend does NO image analysis: it senses, streams and effectuates.
-# Bead detection/tracking is a CLIENT concern, done off the Pi on the recorded
-# or streamed footage (see viscosity/ and viscosity_agent/).
+# SCOPIO node parameters, loaded by microscope.launch.py; baked into the image (see ../../../docs/CONFIGURATION.md).
 
 /scopio/camera_node:
   ros__parameters:
@@ -11,68 +6,39 @@
     height: 480
     framerate: 30.0          # capture fps (drives exposure/gain budget)
     publish_fps: 15.0        # rate of the compressed image topic
-    jpeg_quality: 70
-    # NOTE: the camera node no longer records. Recording is a client concern
-    # (the UI saves the subscribed stream to its own local folder).
 
 /scopio/stage_node:
   ros__parameters:
-    # Serial device of the Sangaboard. Empty => the library auto-detects by USB
-    # vendor/product id, which misses a board behind an unrecognised bridge.
-    # SANGABOARD_PORT in ros2_ws/.env wins over this.
-    port: ""
+    port: ""                 # empty = auto-detect; SANGABOARD_PORT in .env wins
     reconnect_period: 10.0
     publish_rate: 5.0        # Hz, StagePosition
-    step_x: 40               # default jog/grid step (steps)
+    step_x: 40               # declared but unused by the node
     step_y: 40
     step_z: 40
 
 /scopio/galvo_node:
   ros__parameters:
-    # VISA resource of the AWG. Empty => auto-discover the first RIGOL-vendor USB
-    # device (it never opens another vendor's instrument). Set GALVO_RESOURCE in
-    # ros2_ws/.env to name it explicitly; that wins over this.
-    resource: ""
+    resource: ""             # empty = first USB Rigol; GALVO_RESOURCE in .env wins
     init_on_connect: true    # on connect, DC mode + outputs ON, so update(ch,val) moves the galvo
     publish_rate: 5.0        # Hz, AwgStatus (cached state, no polling)
     reconnect_period: 15.0
-    # 15 s, not 5: a large arbitrary-waveform upload takes the DG1022Z a few
-    # seconds to ingest over USB-TMC.
-    timeout_ms: 15000
+    timeout_ms: 15000        # long: a large waveform upload takes the AWG seconds
 
 /scopio/temperature_node:
   ros__parameters:
-    # Address of the TC10 LAB. Empty => auto-discover the first WAVELENGTH-vendor
-    # USB device. TCLAB_RESOURCE in ros2_ws/.env wins over this, and must be set
-    # for an Ethernet unit (pyvisa-py cannot scan the LAN) or to use the kernel
-    # usbtmc device (TCLAB_RESOURCE=/dev/usbtmc0).
-    resource: ""
+    resource: ""             # empty for USB (transport by kernel ownership); TCLAB_RESOURCE in .env wins
     units: "C"               # forced on connect; "" reads them instead
-    # 1 Hz costs FIVE USB-TMC round trips per second (see TC10LAB.status()).
-    # Turn it down if the instrument reports timeouts under load.
-    publish_rate: 1.0        # Hz, TemperatureStatus (this node polls)
-    # 5 s, not 15: opening this instrument is quick, and the session is only
-    # dropped after three consecutive failures, so retrying often cannot thrash.
-    reconnect_period: 5.0
+    publish_rate: 1.0        # Hz, polled: five USB round trips per poll
+    reconnect_period: 5.0    # short: opening is quick, and drops need three failures
     timeout_ms: 5000
 
 /scopio/relay_node:
   ros__parameters:
-    # BCM pin driving the laser relay. Do NOT use 14, 15 or 23-25: the
-    # sangaboard has them. 17 is physical pin 11.
-    gpio_pin: 17
-    # false = active-LOW relay board. READ THIS BEFORE SETTING IT: a Pi pin is
-    # an input with a pulldown until this node claims it, i.e. LOW, i.e. an
-    # active-low board is CLOSED -- laser ON -- from power-on through kernel
-    # boot, docker start and node startup, and for as long as this node stays
-    # down. Pin the line high in /boot/firmware/config.txt first:
-    #   gpio=17=op,dh
-    active_high: true
+    gpio_pin: 17             # BCM, physical pin 11; not 14, 15 or 23-25 (the Sangaboard's)
+    # LASER SAFETY: active-low on this rig, so config.txt needs gpio=17=op,dh or the pulled-low pin means laser ON.
+    active_high: false
     reconnect_period: 10.0   # s between attempts to claim the pin
 
 /scopio/calibration_node:
   ros__parameters:
-    # Persisted spatial calibration. Relative to the process working directory,
-    # which compose sets to /workspace -- the bind-mounted repo root on the Pi,
-    # so it survives `docker compose down`. The node logs the absolute path.
-    calibration_file: "calibration.json"
+    calibration_file: "calibration.json"   # relative to /data, i.e. ros2_ws/data on the Pi

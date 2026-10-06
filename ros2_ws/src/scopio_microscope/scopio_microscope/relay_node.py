@@ -1,21 +1,5 @@
 #!/usr/bin/env python3
-"""relay_node - the laser relay, a single GPIO pin on the Pi itself.
-
-  srv  relay/set    std_srvs/SetBool   data=true -> laser ON
-  pub  relay/state  std_msgs/Bool      latched, so late subscribers get it
-
-Same shape as every other driver node here: the pin is not a precondition for
-running. If gpiozero cannot claim it (the line is held by a leftover process,
-/dev/gpiochip* not visible in the container yet) the node still comes up,
-relay/set answers with the reason, and a retry timer keeps trying.
-
-THE ONE RULE: NEVER PUBLISH `false` FOR A STATE WE DID NOT REACH. If a GPIO
-call throws, the relay's real position is unknown, and "unknown" reported as
-"off" is a green button next to a live laser. Unknown is published as ON until
-an off() actually succeeds. Re-opening the device drives it off (initial_value
-is the OFF state for either polarity), so recovery and the safe action are the
-same operation.
-"""
+"""relay_node - the laser relay on one GPIO pin; never reports OFF for a state it did not reach."""
 
 import threading
 
@@ -32,6 +16,7 @@ class RelayNode(Node):
         super().__init__("relay_node")
 
         # BCM numbering. Do NOT use 14, 15 or 23-25: the sangaboard has them.
+        # Until this node claims the pin it is pulled LOW: on an active-low board that is laser ON (gpio=17=op,dh).
         self.declare_parameter("gpio_pin", 17)
         self.declare_parameter("active_high", True)
         self.declare_parameter("reconnect_period", 10.0)
@@ -39,17 +24,13 @@ class RelayNode(Node):
         self.gpio_pin = int(self.get_parameter("gpio_pin").value)
         self.active_high = bool(self.get_parameter("active_high").value)
 
-        # RLock: _open/_release are reached from both the service callback and
-        # the retry timer, and _set_relay calls _release while already holding it.
+        # RLock: _set_relay calls _release while already holding it.
         self._lock = threading.RLock()
         self._relay = None
         self._state = False
         self._last_error = ""
 
-        # Latched (TRANSIENT_LOCAL, depth 1): a UI that starts after this node
-        # still learns whether the laser is on. Created BEFORE the pin is
-        # claimed, so the topic exists in the graph even when the GPIO does not
-        # -- clients subscribe to it unconditionally.
+        # Latched, and created before the pin is claimed, so the topic exists even when the GPIO does not.
         state_qos = QoSProfile(depth=1)
         state_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
         self.state_pub = self.create_publisher(Bool, "relay/state", state_qos)
@@ -115,8 +96,7 @@ class RelayNode(Node):
                 response.message = "Relay ON" if self._state else "Relay OFF"
                 self.get_logger().info(response.message)
             except Exception as exc:
-                # The pin threw: the relay could be in either position. Force it
-                # off -- and report OFF only if that call itself succeeded.
+                # The relay could be in either position: force it off, and report OFF only if that worked.
                 try:
                     self._relay.off()
                     self._state = False
@@ -136,11 +116,7 @@ class RelayNode(Node):
         with self._lock:
             relay, self._relay = self._relay, None
             if relay is not None:
-                # Hardware first, each step in its own try. Under `ros2 launch`,
-                # SIGINT tears the rclpy context down before this runs, so the
-                # publish below throws InvalidHandle -- sharing one try with
-                # off()/close() would leave a laser energized over a failure
-                # that has nothing to do with the laser.
+                # Hardware first, each step in its own try: the publish may throw InvalidHandle at shutdown.
                 try:
                     relay.off()
                     self._state = False

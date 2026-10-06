@@ -1,21 +1,4 @@
-"""temperature_node - the sample temperature controller, exposed whole.
-
-Same pattern as galvo_node: the node owns a TC10LAB driver object and offers
-every public method of it over one service.
-
-  srv  temperature/call    scopio_interfaces/InstrumentCall
-  pub  temperature/status  scopio_interfaces/TemperatureStatus  (polled)
-
-Raw SCPI comes free -- the driver's command/query are public methods:
-method="query", args='["TEC:ACT?"]'.
-
-A FAILED CALL DOES NOT DROP THE SESSION. It takes MAX_FAILURES consecutive
-failures. One slow reply is normal on a USB-TMC instrument being polled every
-second, and tearing the session down for it produced the worst possible
-behaviour: connected, one good reading, disconnected, silent until the retry
-timer came round, repeat. The status topic carries `last_error` the whole time,
-so a real fault is visible immediately without the link being thrown away.
-"""
+"""temperature_node - the Wavelength TC10 LAB temperature controller, exposed whole (see ../README.md)."""
 
 import math
 import os
@@ -29,6 +12,7 @@ from rclpy.node import Node
 from scopio_interfaces.msg import TemperatureStatus
 from scopio_interfaces.srv import InstrumentCall
 
+from .connect_guard import ConnectGuard
 from .drivers import dispatch
 from .drivers.TC10LAB import TC10LAB
 
@@ -53,14 +37,16 @@ class TemperatureNode(Node):
         self.declare_parameter("reconnect_period", 15.0)
         self.declare_parameter("units", "C")
 
-        # Held for the whole of _connect/_release, so a reconnect asked for over
-        # the service cannot race the retry timer into two sessions on one device.
+        # Held across _connect/_release: a service reconnect must not race the timer into two sessions.
         self._lock = threading.RLock()
         self.tc = None
         self.idn = ""
         self.last_error = ""
         self.state = {}
         self._failures = 0
+        # A hard deadline per connect: a VISA open can hang in libusb (see connect_guard.py).
+        timeout_s = int(self.get_parameter("timeout_ms").value) / 1000.0
+        self._guard = ConnectGuard(3 * timeout_s + 5.0)
 
         self._connect()
 
@@ -68,43 +54,43 @@ class TemperatureNode(Node):
         cb = ReentrantCallbackGroup()
         self.create_service(InstrumentCall, "temperature/call", self._on_call,
                             callback_group=cb)
-        # The timers stay in the node's default (mutually exclusive) group, so a
-        # slow instrument cannot stack polls on top of each other.
+        # Default (exclusive) group: a slow instrument cannot stack polls.
         rate = max(0.1, float(self.get_parameter("publish_rate").value))
         self.create_timer(1.0 / rate, self._publish_status)
         period = max(2.0, float(self.get_parameter("reconnect_period").value))
         self.create_timer(period, self._retry_connect)
 
     def _connect(self):
-        # .strip(): a value pasted into .env from a Windows editor carries a
-        # trailing \r, and "/dev/usbtmc0\r" is a different path than the one on
-        # disk -- ENOENT, which looks exactly like a missing instrument.
+        # .strip(): a trailing \r from a Windows editor makes a path that does not exist.
         resource = (os.environ.get("TCLAB_RESOURCE")
                     or self.get_parameter("resource").value or "").strip()
         timeout_ms = int(self.get_parameter("timeout_ms").value)
         units = str(self.get_parameter("units").value).strip()
+
+        def attempt():
+            tc = TC10LAB(resource, timeout_ms=timeout_ms)
+            try:
+                tc._open()     # picks the transport, clears, verifies *IDN?
+            except BaseException:
+                tc._close()
+                raise
+            # Units are only a label: best-effort, never a reason to fail a working link.
+            try:
+                tc.set_units(units) if units else tc.get_units()
+            except Exception as exc:
+                self.get_logger().warning(f"TC10 LAB units unavailable ({exc}).")
+            return tc
+
         with self._lock:
             if self.tc is not None:
                 return True
-            tc = TC10LAB(resource, timeout_ms=timeout_ms)
             try:
-                tc._open()
-                idn = tc.idn()
-                # Units are a LABEL on the status topic. Best-effort, like the
-                # galvo's dcinit: a link that answers *IDN? is a working link,
-                # and throwing it away because one cosmetic reply came back in
-                # an unexpected format is how a connected instrument reads as
-                # absent. (This firmware answers TEC:UNITS? with 'CELSIUS'.)
-                try:
-                    tc.set_units(units) if units else tc.get_units()
-                except Exception as exc:
-                    self.get_logger().warning(f"TC10 LAB units unavailable ({exc}).")
-                self.tc, self.idn, self.last_error = tc, idn, ""
+                tc = self._guard.run(attempt, discard=lambda t: t._close())
+                self.tc, self.idn, self.last_error = tc, tc.identity, ""
                 self._failures = 0
             except Exception as exc:
-                tc._close()
-                self.last_error = str(exc)
-                asked = repr(resource) if resource else "<auto-discover Wavelength on USB>"
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                asked = repr(resource) if resource else "<auto: kernel usbtmc or VISA>"
                 self.get_logger().warning(
                     f"TC10 LAB unavailable; node runs, reports connected=false.\n"
                     f"  tried:  {asked}\n"
@@ -113,7 +99,7 @@ class TemperatureNode(Node):
                 return False
         if tc.probe_note:
             self.get_logger().warning(f"TCLAB_RESOURCE {tc.probe_note}")
-        self.get_logger().info(f"TC10 LAB connected on {tc.resource}: {idn}")
+        self.get_logger().info(f"TC10 LAB connected on {tc.resource}: {tc.identity}")
         return True
 
     def _retry_connect(self):
@@ -130,8 +116,7 @@ class TemperatureNode(Node):
             return True
 
     def _note_failure(self, exc):
-        """Record an instrument failure; drop the session only once they pile up.
-        See the module docstring -- a single timeout is not a dead link."""
+        """Record an I/O failure; drop the session only after MAX_FAILURES in a row."""
         self.last_error = str(exc)
         self._failures += 1
         if self._failures >= MAX_FAILURES and self._release():
@@ -204,6 +189,10 @@ class TemperatureNode(Node):
         except dispatch.DispatchError as exc:   # bad request: the link is fine
             response.success = False
             response.error = str(exc)
+        except (ValueError, TypeError) as exc:
+            # A refused argument or an unparseable reply: the link is alive, so no strike.
+            response.success = False
+            response.error = f"{type(exc).__name__}: {exc}"
         except Exception as exc:                # instrument or method fault
             self._note_failure(exc)
             response.success = False
@@ -211,8 +200,7 @@ class TemperatureNode(Node):
         return response
 
     def destroy_node(self):
-        # The TEC output is deliberately left as-is: a sample being held at
-        # temperature should survive a backend restart.
+        # The TEC output is left as-is: a sample held at temperature survives a restart.
         tc = self.tc
         if tc is not None:
             try:

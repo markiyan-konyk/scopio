@@ -1,11 +1,4 @@
-"""Bring up the full SCOPIO microscope sensor/effectuator graph.
-
-    ros2 launch scopio_microscope microscope.launch.py
-
-All driver nodes start under the /scopio namespace and load their parameters
-from config/params.yaml. Each node degrades gracefully if its hardware is
-absent, so the graph comes up even on an incomplete rig.
-"""
+"""Launch every SCOPIO node under /scopio with config/params.yaml."""
 
 import os
 
@@ -16,13 +9,7 @@ from launch_ros.actions import Node
 
 
 def build_stamp():
-    """When the image running these nodes was built (see Dockerfile).
-
-    Printed first, every launch, because the nodes run from the IMAGE and not
-    from the mounted repo: without this, `docker compose up -d` after an edit
-    silently reruns the old code and the log is indistinguishable from a fix
-    that did not work. If this timestamp predates your edit, rebuild.
-    """
+    """When the image was built; printed first, so an edit run without --build is visible."""
     try:
         with open("/ros2_ws/BUILD_STAMP", encoding="utf-8") as f:
             return f.read().strip()
