@@ -1,10 +1,14 @@
 # SCOPIO
 
-The Raspberry Pi side of a self-driving-lab microscope. It owns the hardware and exposes all of it through one authenticated HTTP/WebSocket API.
+**Scopio is a roboticized microscope system that allows you to control your microscope in any way you want through an API system**
 
 Built by Markiyan Konyk, Minho Kim and Jesus Valdes at The MatterLab (University of Toronto).
 
-SCOPIO is the hardware layer of a self-driving-lab microscope, built on the OpenFlexure microscope, for a cryogenics lab. Every sensor and actuator is a ROS 2 node on a Raspberry Pi, always available behind one authenticated API. Any program, whether a UI, a script or an AI agent, can run experiments without touching the hardware code. New hardware capabilities get implemented as new nodes.
+
+
+SCOPIO is the hardware layer of a self-driving-lab microscope, that lives inside a Raspberry Pi. Originally on an upgraded OpenFlexure microscope, for a cryogenics lab, where optical tweezers and temperature control were added. Every sensor and actuator is a ROS 2 node on a Raspberry Pi, always available behind one authenticated API. Any program, whether a UI, a script or an AI agent, can run experiments without touching the hardware code. New hardware capabilities get implemented as new nodes.
+
+Scopio was built with the intention of maximizing flexibility in microscopy experiments and simplifying long data recollection procedures, with the long-term view of automatizing experiment -> data processing -> evaluation procedures.
 
 ## Two repos, two machines
 
