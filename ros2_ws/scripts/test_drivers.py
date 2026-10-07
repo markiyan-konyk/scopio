@@ -328,6 +328,96 @@ def test_status_costs_five_round_trips():
     assert "TEC:UNITS?" not in asked      # cached by set_units()/get_units()
 
 
+# ------------------------------------------------- TC10 LAB: setpoint ramp
+def tc10(**replies):
+    tc = TC10LAB("TCPIP::fake::INSTR")
+    tc.device = FakeDevice({"TEC:LIMit:TLO?": "-10", "TEC:LIMit:THI?": "80",
+                            "TEC:ACT?": "20.0", **replies})
+    return tc
+
+
+def setpoints(tc):
+    return [float(w.split()[1]) for w in tc.device.writes if w.startswith("TEC:SET ")]
+
+
+def wait_for(tc, state, limit=3.0):
+    import time
+    end = time.monotonic() + limit
+    while tc.ramp_status()["state"] != state:
+        assert time.monotonic() < end, f"ramp never reached {state!r}: {tc.ramp_status()}"
+        time.sleep(0.01)
+
+
+def test_ramp_walks_the_setpoint_from_the_measured_temperature():
+    """A ramp starts at the measured temperature (no jump), climbs monotonically and ends exactly on target."""
+    tc = tc10()
+    status = tc.ramp(21, rate=300, interval=0.1)       # 1 degree at 5 degrees/s: 0.2 s
+    assert status["state"] == "ramping" and status["start"] == 20.0, status
+    wait_for(tc, "done")
+    sent = setpoints(tc)
+    assert len(sent) >= 2, sent
+    assert sent == sorted(sent) and 20.0 <= sent[0] < 21.0, sent
+    assert sent[-1] == 21.0 and tc.device.writes[-1] == "TEC:SET 21.000"
+    assert tc.ramp_status()["setpoint"] == 21.0
+
+
+def test_ramp_rate_can_be_changed_mid_way_without_a_jump():
+    """Calling ramp() again re-rates it from the setpoint already reached, not from the start."""
+    import time
+    tc = tc10()
+    tc.ramp(15, rate=60, interval=0.1)                 # 1 degree/s: 5 s down to 15
+    time.sleep(0.35)
+    reached = tc.ramp_status()["setpoint"]
+    assert reached < 20.0, reached
+    status = tc.ramp(15, rate=1200, interval=0.1)      # now 20 degrees/s
+    assert status["start"] <= reached, (status, reached)
+    wait_for(tc, "done")
+    sent = setpoints(tc)
+    assert sent == sorted(sent, reverse=True), sent
+    assert sent[-1] == 15.0
+
+
+def test_set_setpoint_and_close_stop_a_ramp():
+    import time
+    tc = tc10()
+    tc.ramp(60, rate=60, interval=0.1)
+    time.sleep(0.15)
+    tc.set_setpoint(30)
+    assert tc.ramp_status()["state"] == "stopped"
+    time.sleep(0.25)
+    assert tc.device.writes[-1] == "TEC:SET 30", tc.device.writes[-3:]
+
+    tc.ramp(60, rate=60, interval=0.1)
+    tc._close()                                        # must not deadlock on the I/O lock
+    assert tc.ramp_status()["state"] == "stopped"
+
+
+def test_ramp_refuses_bad_arguments_before_writing():
+    tc = tc10()
+    for kwargs in ({"rate": 0}, {"rate": -1}, {"rate": float("nan")},
+                   {"rate": float("inf")}, {"rate": 1, "interval": 0.01},
+                   {"rate": 1, "target": 95}, {"rate": 1, "start": -20}):
+        kwargs.setdefault("target", 25)
+        try:
+            tc.ramp(**kwargs)
+        except ValueError:
+            continue
+        raise AssertionError(f"ramp({kwargs}) must refuse")
+    assert not setpoints(tc) and tc.ramp_status()["state"] == "idle"
+
+
+def test_ramp_gives_up_after_repeated_write_failures():
+    tc = tc10()
+
+    def broken(cmd):
+        if cmd.startswith("TEC:SET"):
+            raise TimeoutError("VI_ERROR_TMO")
+    tc.device.write = broken
+    tc.ramp(25, rate=60, interval=0.1)
+    wait_for(tc, "failed")
+    assert "TimeoutError" in tc.ramp_status()["error"]
+
+
 # ------------------------------------------------ TC10 LAB: finding the box
 class FakeRM:
     """pyvisa.ResourceManager('@py') stand-in that lists and opens fake devices."""

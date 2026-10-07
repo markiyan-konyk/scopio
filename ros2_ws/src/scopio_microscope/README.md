@@ -114,6 +114,7 @@ The node owns one `drivers/TC10LAB.TC10LAB` object and exposes all of it. Raw SC
 
 - **It polls.** Each status publish calls `status()`: five queries (condition, actual temperature, setpoint, current, voltage). At 1 Hz that is five USB round trips per second.
 - **The setpoint is separate from the output.** `set_setpoint(25)` changes the target, but nothing heats or cools until `output(True)`. The rear-panel Remote Enable input can override the output.
+- **For a slow, near-linear change use `ramp(target, rate)`** (degrees per minute) instead of `set_setpoint`, which jumps and makes the loop ring. The ramp runs in the background; `ramp_status()` and `ramp_stop()` follow and end it. See [the setpoint ramp](scopio_microscope/drivers/README.md#tc10-setpoint-ramp).
 - **The transport is chosen by who owns the device**, not by the form of `TCLAB_RESOURCE`. See [the driver contract](scopio_microscope/drivers/README.md#tc10-transport-by-ownership).
 - Units are forced on connect (`units: "C"`). They are only a label: a failure there never fails the connect.
 - **3 failed I/Os in a row** drop the session. One slow reply is normal on a polled USB-TMC instrument, and `last_error` on the status topic shows it at once. A refused argument or an unparseable reply in a call does not count.

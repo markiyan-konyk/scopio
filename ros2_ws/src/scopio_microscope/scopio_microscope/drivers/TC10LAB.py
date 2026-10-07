@@ -128,6 +128,7 @@ class UsbtmcDevice:
 class TC10LAB:
     # Pacing: at most 50 I/Os per second; the TC10 lags badly past ~60/s.
     MIN_INTERVAL_S = 1.0 / 50
+    RAMP_MAX_FAILURES = 3          # failed setpoint writes in a row before a ramp gives up
 
     def __init__(self, resource="", timeout_ms=5000):
         self.resource = resource
@@ -141,6 +142,11 @@ class TC10LAB:
         self.probe_note = ""  # set when _open had to work around the config
         self._rejected = []   # usbtmc nodes tried and why they were refused
         self._desynced = False  # a query failed; drain before trusting the next
+        self._ramp_ctl = threading.Lock()    # serialises starting and stopping ramps
+        self._ramp_state = threading.Lock()  # guards the fields below; never held during I/O
+        self._ramp = {"state": "idle"}
+        self._ramp_stop = None               # Event of the running ramp thread
+        self._ramp_thread = None
 
     # ======================================================================
     # Connecting
@@ -301,6 +307,8 @@ class TC10LAB:
 
     def _close(self):
         """Drop the session. Safe to call twice, and on an already-dead link."""
+        # No join: the ramp thread may be waiting for _lock, which is taken below.
+        self._ramp_halt(join=False)
         with self._lock:
             for handle in (self.device, self.rm):
                 try:
@@ -369,7 +377,12 @@ class TC10LAB:
     def calibration_date(self): return self.query("CALdate?")
     def uptime(self):           return self.query("TIME?")          # D:HH:MM:SS.ss
     def stopwatch(self):        return self.query("TIMER?")         # since last call
-    def reset(self):            return self.command("*RST")         # factory defaults, output OFF
+    def reset(self):
+        """Factory defaults, output OFF; stops a running ramp."""
+        with self._ramp_ctl:
+            self._ramp_halt()
+            return self.command("*RST")
+
     def clear_status(self):     return self.command("*CLS")
     def opc(self):              return self.query("*OPC?")
     def local(self):            return self.command("LOCAL")        # give the front panel back
@@ -397,7 +410,13 @@ class TC10LAB:
     # ======================================================================
     def temperature(self):      return self.query_float("TEC:ACT?")     # actual, active units
     def get_setpoint(self):     return self.query_float("TEC:SET?")
-    def set_setpoint(self, degrees): return self.command(f"TEC:SET {degrees}")   # active units
+
+    def set_setpoint(self, degrees):
+        """Jump the setpoint to `degrees` (active units); stops a running ramp. Use ramp() for a slow change."""
+        with self._ramp_ctl:
+            self._ramp_halt()
+            return self.command(f"TEC:SET {degrees}")
+
     def current(self):          return self.query_float("TEC:I?")       # TEC current, A (signed)
     def voltage(self):          return self.query_float("TEC:V?")       # TEC voltage, V
     def aux_temperature(self):  return self.query_float("TEC:AUX?")     # 2nd sensor (heatsink)
@@ -435,9 +454,118 @@ class TC10LAB:
     def set_step(self, hundredths):  return self.command(f"TEC:STEP {int(hundredths)}")  # 1 == 0.01 C
     def get_step(self):              return self.query_int("TEC:STEP?")
     def step_up(self, steps=1, pause_ms=0):
-        return self.command(f"TEC:INC {int(steps)},{int(pause_ms)}")
+        with self._ramp_ctl:
+            self._ramp_halt()
+            return self.command(f"TEC:INC {int(steps)},{int(pause_ms)}")
     def step_down(self, steps=1, pause_ms=0):
-        return self.command(f"TEC:DEC {int(steps)},{int(pause_ms)}")
+        with self._ramp_ctl:
+            self._ramp_halt()
+            return self.command(f"TEC:DEC {int(steps)},{int(pause_ms)}")
+
+    # ======================================================================
+    # Setpoint ramp -- a background thread walking TEC:SET at a fixed rate
+    # ======================================================================
+    def ramp(self, target, rate, interval=1.0, start=None):
+        """Move the setpoint to `target` at `rate` degrees/minute (active units) in the background; returns ramp_status()."""
+        target, rate, interval = float(target), float(rate), float(interval)
+        if not 0 < rate < float("inf"):
+            raise ValueError(f"rate must be a positive number of degrees per minute, got {rate}")
+        if not 0.1 <= interval <= 60:
+            raise ValueError(f"interval must be 0.1..60 s between setpoint updates, got {interval}")
+        with self._ramp_ctl:
+            low, high = self.get_temperature_limits()
+            for name, value in (("target", target), ("start", start)):
+                if value is not None and not low <= float(value) <= high:
+                    raise ValueError(f"{name} {value} is outside the temperature "
+                                     f"limits {low}..{high} (set_temperature_limits)")
+            running = self._ramp_halt()
+            # Continue from a running ramp's setpoint; otherwise from the measured temperature, so nothing jumps.
+            start = float(start if start is not None
+                          else running if running is not None
+                          else self.temperature())
+            stop = threading.Event()
+            t0 = time.monotonic()
+            with self._ramp_state:
+                self._ramp = {"state": "ramping", "start": start, "target": target,
+                              "rate": rate, "interval": interval, "setpoint": None,
+                              "started": t0, "error": ""}
+                self._ramp_stop = stop
+                self._ramp_thread = threading.Thread(
+                    target=self._ramp_run, name="tc10-ramp", daemon=True,
+                    args=(stop, start, target, rate, interval, t0))
+                self._ramp_thread.start()
+        return self.ramp_status()
+
+    def ramp_stop(self):
+        """Stop a running ramp and hold the setpoint where it got to; returns ramp_status()."""
+        with self._ramp_ctl:
+            self._ramp_halt()
+        return self.ramp_status()
+
+    def ramp_status(self):
+        """The ramp: state (idle/ramping/done/stopped/failed), start, target, rate, setpoint, elapsed_s, remaining_s, error."""
+        with self._ramp_state:
+            r = dict(self._ramp)
+        started = r.pop("started", None)
+        if started is not None:
+            r["elapsed_s"] = round(time.monotonic() - started, 1)
+        if r["state"] == "ramping":
+            at = r["setpoint"] if r["setpoint"] is not None else r["start"]
+            r["remaining_s"] = round(abs(r["target"] - at) / r["rate"] * 60.0, 1)
+        return r
+
+    def _ramp_run(self, stop, start, target, rate, interval, t0):
+        """The ramp thread: setpoint = start + rate * elapsed, so a slow or failed write never slows the ramp."""
+        direction = 1.0 if target >= start else -1.0
+        failures, last = 0, None
+        while True:
+            value = start + direction * rate * (time.monotonic() - t0) / 60.0
+            done = (value - target) * direction >= 0
+            value = round(target if done else value, 3)
+            try:
+                if value != last:
+                    self.command(f"TEC:SET {value:.3f}")
+                    last = value
+                    self._ramp_update(stop, setpoint=value)
+                failures = 0
+            except Exception as exc:
+                if stop.is_set():
+                    return
+                failures += 1
+                if failures >= self.RAMP_MAX_FAILURES:
+                    self._ramp_update(stop, state="failed",
+                                      error=f"{type(exc).__name__}: {exc}")
+                    return
+                done = False
+            if done:
+                self._ramp_update(stop, state="done")
+                return
+            if stop.wait(interval):
+                return
+
+    def _ramp_update(self, stop, **fields):
+        """Record ramp progress, unless a newer ramp has replaced the thread that owns `stop`."""
+        with self._ramp_state:
+            if self._ramp_stop is stop:
+                self._ramp.update(fields)
+
+    def _ramp_halt(self, join=True):
+        """Stop the ramp thread if one is running; returns the setpoint it last wrote, else None."""
+        with self._ramp_state:
+            stop, thread = self._ramp_stop, self._ramp_thread
+        if stop is None:
+            return None
+        stop.set()
+        if join and thread is not threading.current_thread():
+            thread.join()      # after this its last write is recorded, so a new ramp continues from it
+        with self._ramp_state:
+            if self._ramp_stop is not stop:
+                return None
+            self._ramp_stop = self._ramp_thread = None
+            if self._ramp["state"] != "ramping":
+                return None
+            self._ramp["state"] = "stopped"
+            return self._ramp["setpoint"]
 
     # ======================================================================
     # Sensor selection & bias
@@ -590,7 +718,12 @@ class TC10LAB:
     # Stored profiles (1..10; 0 is the read-only factory profile)
     # ======================================================================
     def save_profile(self, n):    return self.command(f"*SAV {int(n)}")
-    def recall_profile(self, n):  return self.command(f"*RCL {int(n)}")   # output shuts off
+    def recall_profile(self, n):
+        """Load stored profile n (1..10); the output shuts off and a running ramp stops."""
+        with self._ramp_ctl:
+            self._ramp_halt()
+            return self.command(f"*RCL {int(n)}")
+
     def name_profile(self, n, line1="", line2=""):
         return self.command(f"PROFile:DESC {int(n)},{line1},{line2}")
     def get_profile_name(self, n):     return self.query(f"PROFile:DESC? {int(n)}")

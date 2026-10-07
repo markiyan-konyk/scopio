@@ -85,6 +85,33 @@ Offsets and positions live in the object only. A reconnect builds a new object, 
 - **Set the safety limits before enabling the output.** `set_current_limits`, `set_temperature_limits` and `set_sensor_limits` exist; the node sets none of them.
 - Transient faults (sensor open or shorted) trip the output and then clear. `faults()` may miss them; `event()` latches them (and reading it clears it).
 
+### TC10 setpoint ramp
+
+`set_setpoint(25)` jumps the target. The PID loop then overshoots and rings around it. `ramp(25, rate=0.5)` instead moves the setpoint in small steps, at 0.5 degrees per minute, so the loop only ever chases a small error and the temperature follows a near-straight line.
+
+```
+POST /api/v1/service/temperature/call
+{"method": "ramp", "args": "[25]", "kwargs": "{\"rate\": 0.5}"}
+```
+
+| Method | What it does |
+|---|---|
+| `ramp(target, rate, interval=1.0, start=None)` | Starts the ramp and returns at once. `rate` is in active units per minute. `interval` is the seconds between setpoint writes (0.1 to 60). |
+| `ramp_status()` | `state` (`idle`, `ramping`, `done`, `stopped`, `failed`), `start`, `target`, `rate`, `setpoint` (last written), `elapsed_s`, `remaining_s`, `error`. Costs no I/O. |
+| `ramp_stop()` | Stops the ramp and holds the setpoint where it got to. |
+
+- **It runs on the host**, in a thread inside the driver. Each tick writes `start + rate × elapsed`, so a slow or failed write never slows the ramp; the next tick catches up. Three failed writes in a row end it as `failed`.
+- **It starts from the measured temperature** (`TEC:ACT?`), so the setpoint does not jump at the start. Pass `start` to override.
+- **Change the slope by calling `ramp()` again**, with the same or a new target. It continues from the setpoint already reached, so changing the rate mid-way does not jump either.
+- `set_setpoint`, `step_up`, `step_down`, `reset` and `recall_profile` stop a running ramp, and so does dropping the session. A ramp does not survive a reconnect or a backend restart: the setpoint stays where it got to.
+- `target` and `start` must lie inside the instrument's temperature limits (`get_temperature_limits`). A ramp moves only the setpoint: nothing heats or cools until `output(True)`.
+- `temperature/status` shows the moving setpoint, because `status()` already reads `TEC:SET?`.
+
+**Choosing the rate.** The temperature lags the setpoint by about rate × the loop's response time. It overshoots the target by roughly that lag at the end, and then settles. Slower ramps give a smaller lag and a straighter line. `interval` only sets how fine the staircase is: at 1 degree per minute and 1 s, each step is 0.017 degrees, well below what the loop can resolve.
+<!-- TODO: measure the lag and end overshoot on the real stage at a few rates and record a recommended range here. -->
+
+The instrument also has its own ramps (`step_up`/`step_down` with a pause, and `profile_scan`). The host ramp exists because its rate is given directly in degrees per minute, can be changed or stopped mid-way, and reports its progress.
+
 ### TC10 transport by ownership
 
 A USB TC10 is either owned by the kernel's `usbtmc` driver, which binds at plug-in and creates `/dev/usbtmcN`, or owned by nobody. That, not the form of `TCLAB_RESOURCE`, decides how `_open()` reaches it:
